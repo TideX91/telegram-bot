@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "updatedAt": "2026-08-21T10:00:00.000Z",
+  "targets": {
+    "market": {
+      "cursor": "18253611008000000-4294967295",
+      "lastEventLedger": 4250000
+    },
+    "squad": {
+      "cursor": "18253611008000000-4294967295",
+      "lastEventLedger": 4250000
+    }
+  }
+}

@@ -37,12 +37,17 @@ function baseStatus(overrides = {}) {
     eventsSkipped: 1,
     consecutiveFailures: 0,
     lastError: null,
+    restartGaps: 0,
+    lastRestartGap: null,
     targets: [
       {
         source: "market",
         contractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
         cursor: "0018276211125911551-4294967295",
         lastEventLedger: 40,
+        gapLedgers: 0,
+        cursorResetAt: null,
+        cursorUnreadable: false,
         lastError: null,
       },
     ],
@@ -93,6 +98,54 @@ test("buildHealthReport never embeds bot token or chat id", () => {
   assert.equal(blob.includes(config.botToken), false);
   assert.equal(blob.includes(config.chatId), false);
   assert.equal(blob.includes("SECRET-TOKEN"), false);
+});
+
+test("buildHealthReport surfaces a restart gap as ledger numbers, not secrets", () => {
+  const report = buildHealthReport(
+    baseConfig(),
+    baseStatus({
+      restartGaps: 1,
+      lastRestartGap: {
+        at: 5_000,
+        source: "market",
+        cursorLedger: 4_250_000,
+        oldestLedger: 4_300_000,
+        missedLedgers: 50_000,
+      },
+      targets: [{ ...baseStatus().targets[0], gapLedgers: 50_000, cursorResetAt: 5_000 }],
+    }),
+    5_500,
+  );
+
+  assert.equal(report.ok, true);
+  assert.equal(report.poller.restartGaps, 1);
+  assert.deepEqual(report.poller.lastRestartGap, {
+    at: "1970-01-01T00:00:05.000Z",
+    source: "market",
+    cursorLedger: 4_250_000,
+    oldestLedger: 4_300_000,
+    missedLedgers: 50_000,
+  });
+  assert.equal(report.poller.targets[0].gapLedgers, 50_000);
+  assert.equal(report.poller.targets[0].cursorResetAt, "1970-01-01T00:00:05.000Z");
+  assert.equal(report.poller.targets[0].cursorUnreadable, false);
+});
+
+test("buildHealthReport flags an unreadable cursor position without a gap", () => {
+  const report = buildHealthReport(
+    baseConfig(),
+    baseStatus({
+      targets: [
+        { ...baseStatus().targets[0], cursor: "legacy-opaque-cursor", cursorUnreadable: true },
+      ],
+    }),
+    5_500,
+  );
+
+  assert.equal(report.poller.targets[0].cursorUnreadable, true);
+  assert.equal(report.poller.targets[0].gapLedgers, 0);
+  assert.equal(report.poller.restartGaps, 0);
+  assert.equal(report.poller.lastRestartGap, null);
 });
 
 test("startHealthServer with HEALTH_PORT=0 does not bind", async () => {

@@ -47,6 +47,19 @@ export interface HealthReport {
     eventsSkipped: number;
     consecutiveFailures: number;
     lastError: { at: string; message: string } | null;
+    /** Stale cursors reset since this process started. */
+    restartGaps: number;
+    /**
+     * The most recent cursor that fell below the RPC's retained window. The
+     * events it skipped are unrecoverable; this is what made them visible.
+     */
+    lastRestartGap: {
+      at: string;
+      source: string;
+      cursorLedger: number;
+      oldestLedger: number;
+      missedLedgers: number;
+    } | null;
     targets: Array<{
       source: string;
       /** Public contract id (on-chain). */
@@ -54,6 +67,12 @@ export interface HealthReport {
       lastEventLedger: number | null;
       /** Opaque resume cursor; not a secret. Truncated for readability. */
       cursorPreview: string | null;
+      /** Ledgers lost to the retained window at the last restart gap. */
+      gapLedgers: number;
+      /** When a stale cursor was reset to a cold start, or null. */
+      cursorResetAt: string | null;
+      /** A cursor is persisted but its ledger position cannot be read. */
+      cursorUnreadable: boolean;
       hasError: boolean;
     }>;
   };
@@ -122,11 +141,24 @@ export function buildHealthReport(
       lastError: poller.lastError
         ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }
         : null,
+      restartGaps: poller.restartGaps ?? 0,
+      lastRestartGap: poller.lastRestartGap
+        ? {
+            at: new Date(poller.lastRestartGap.at).toISOString(),
+            source: poller.lastRestartGap.source,
+            cursorLedger: poller.lastRestartGap.cursorLedger,
+            oldestLedger: poller.lastRestartGap.oldestLedger,
+            missedLedgers: poller.lastRestartGap.missedLedgers,
+          }
+        : null,
       targets: poller.targets.map((t) => ({
         source: t.source,
         contractId: t.contractId,
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),
+        gapLedgers: t.gapLedgers ?? 0,
+        cursorResetAt: iso(t.cursorResetAt ?? null),
+        cursorUnreadable: t.cursorUnreadable ?? false,
         hasError: t.lastError !== null,
       })),
     },

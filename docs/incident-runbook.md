@@ -92,6 +92,58 @@ On a cold start, the poller begins from its configured lookback rather than repl
 
 Never replace a cursor with an arbitrary ledger or cursor value unless the repository's cursor format and retained-history requirements have been verified.
 
+### A cursor whose ledger cannot be parsed
+
+`/status` and `/health` report `cursorUnreadable` (per target) when a persisted
+cursor string exists but no ledger sequence can be read out of it. The poller
+leaves that cursor in place: the RPC's cursor is opaque by design, so failing to
+parse it locally is not evidence that the RPC will reject it.
+
+* If the RPC accepts it, the next successful scan advances the cursor and the
+  flag clears on its own.
+* If the RPC keeps rejecting it, the target logs an error every cycle. Preserve
+  the cursor file, then remove it to force a cold start.
+
+## Restart gaps
+
+### Symptoms
+
+* The poller logs `restart gap — cursor at ledger … is … ledger(s) below the RPC
+  retained floor …`.
+* `/status` shows `restart gap: N ledgers unrecoverable, cursor reset …`.
+* `/health` shows a non-zero `restartGaps`, a `lastRestartGap` object, and a
+  non-zero `gapLedgers` for the affected target.
+
+### What happened
+
+The process was down (or one contract's scans were failing) for longer than the
+RPC's rolling event window. The persisted cursor still pointed at a ledger the
+RPC no longer serves, so the events between that cursor and the retained floor
+are permanently unreadable — there is no second copy of event history to fall
+back on. The chain itself is unchanged; only the notification timeline has a
+hole.
+
+The poller detects this against the retained floor, logs it once, and resets the
+affected target's cursor to a cold start (its configured lookback behind the
+tip). It does not reset the cursor to the retained floor, because replaying up to
+a week of events into the chat is exactly the flood the lookback exists to
+avoid.
+
+### Recovery
+
+1. Check `/status` for which target holds the gap and how many ledgers it lost.
+2. Confirm the retained floor with `npm run scan` (it prints the window).
+3. Confirm polling resumes normally: the cursor line shows a cold start until
+   the next successful scan advances it.
+4. If the missed events matter, recover them out of band — `npm run scan
+   --from <ledger>` reads the retained range — rather than by editing cursor
+   state. Anything below the floor cannot be recovered at all.
+5. Do not hand-edit the cursor file to "close" the gap.
+
+A gap is reported once per occurrence. Seeing the same target gap repeatedly
+means the process keeps restarting (check the supervisor and persistent storage)
+or the RPC window keeps rolling past a target that cannot scan successfully.
+
 ## Process restart
 
 ### Persistent deployment
@@ -104,6 +156,8 @@ After a restart:
 2. Confirm the persisted cursor is present.
 3. Confirm polling resumes normally.
 4. Check that counters and last-event ledgers begin advancing again.
+5. Check for a restart gap (see [Restart gaps](#restart-gaps)) — a downtime
+   longer than the RPC's retained window shows up here, not as an error.
 
 ### Ephemeral deployment
 

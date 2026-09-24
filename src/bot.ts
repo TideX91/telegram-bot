@@ -31,7 +31,7 @@ function ago(timestamp: number | null): string {
   return `${Math.round(seconds / 3600)}h ago`;
 }
 
-function statusMessage(config: BotConfig, status: PollerStatus): string {
+export function statusMessage(config: BotConfig, status: PollerStatus): string {
   const lines: string[] = [
     `*Status* — ${status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
     "",
@@ -49,6 +49,18 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
       `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
       `  cursor: \`${target.cursor ?? "none (cold start)"}\``,
     );
+    if (target.gapLedgers > 0) {
+      // The RPC no longer retains these ledgers, so say what was lost and when
+      // the cursor was reset — "none (cold start)" above is the recovery, not
+      // the whole story.
+      lines.push(
+        `  restart gap: ${target.gapLedgers} ledger${target.gapLedgers === 1 ? "" : "s"} unrecoverable` +
+          (target.cursorResetAt !== null ? `, cursor reset ${ago(target.cursorResetAt)}` : ""),
+      );
+    }
+    if (target.cursorUnreadable) {
+      lines.push(`  cursor ledger unreadable: position left untouched`);
+    }
     if (target.lastError) lines.push(`  last error: ${escapeMd(target.lastError)}`);
   }
 
@@ -60,6 +72,9 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
   }
   if (status.consecutiveFailures > 0) {
     lines.push(`Consecutive failed cycles: ${status.consecutiveFailures}`);
+  }
+  if (status.restartGaps > 0) {
+    lines.push(`Restart gaps detected since start: ${status.restartGaps}`);
   }
 
   return lines.join("\n");
