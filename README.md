@@ -57,9 +57,17 @@ the prompts, and copy the token it gives you (`123456789:AA…`).
 
 If your group has [privacy mode](https://core.telegram.org/bots/features#privacy-mode)
 on (the default), the bot only sees messages that are commands or replies to it —
-which is all `/status` needs.
+which covers `/status` and the operator controls below.
 
-### 3. Configure and run
+### 3. Choose an operator (optional)
+
+Set `OPERATOR_TELEGRAM_USER_ID` to the numeric **user** id returned by
+`@userinfobot` to enable `/pause` and `/resume`. The notification
+`TELEGRAM_CHAT_ID` is intentionally not accepted as authorization: in a group,
+everyone can send messages from that chat. If this variable is omitted, existing
+deployments continue unchanged and both operator commands are ignored.
+
+### 4. Configure and run
 
 ```bash
 cp .env.example .env     # then fill in BOT_TOKEN and TELEGRAM_CHAT_ID
@@ -67,11 +75,22 @@ npm install
 npm run dev              # tsx, restarts on change
 ```
 
-For production:
+For production (Node):
 
 ```bash
 npm run build
 npm start
+```
+
+For production (Docker):
+
+```bash
+docker build -t mimir-telegram-bot .
+docker run -d \
+  --name mimir-bot \
+  --env-file .env \
+  -v $(pwd)/data:/app/data \
+  mimir-telegram-bot
 ```
 
 `.env.example` ships with the live Stellar Testnet contract ids, so the only two
@@ -88,6 +107,14 @@ looks healthy but notifies nobody.
 | `/help` | Same, plus the command list |
 | `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, any restart gap (ledgers lost + when the cursor was reset), poll/send counters and the last error |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
+| `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
+| `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
+| `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
+
+Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
+response and cannot mutate poller state. Repeated `/pause` or `/resume` commands
+are idempotent. Control state is process-local: a restart resumes polling and
+loads the existing version-1 cursor file.
 
 ## Reading events without a bot token
 
@@ -99,10 +126,43 @@ npm run scan                     # both contracts, from the RPC's retained floor
 npm run scan -- --pages 40       # walk further
 npm run scan -- --show 20        # print 20 decoded events per contract
 npm run scan -- --from 4226500   # explicit start ledger
+npm run scan -- --json           # one mimir-scan-v1 JSON document on stdout
+npm run scan -- --json --show 20 # JSON including 20 decoded events per contract
 ```
 
-It prints the ledger window, an event-name histogram, and the decoded payloads.
-This is how the decoder was verified against the live deployment.
+Human mode prints the ledger window, an event-name histogram, and the decoded
+payloads. With `--json`, stdout is a single `mimir-scan-v1` document (bigints as
+decimal strings) and progress goes to stderr, so `npm run scan -- --json | jq`
+stays valid. Neither mode prints bot tokens or signing keys — the scanner never
+holds them. This is how the decoder was verified against the live deployment.
+
+## Local mock profile
+
+`MIMIR_PROFILE=mock` (or the scanner's `--mock` flag) fills in any config value
+the environment leaves unset with a **local, loopback-only** Soroban mock:
+fixture contract ids, `http://127.0.0.1:8420` RPC, and an isolated cursor file
+at `data/cursor.mock.json` so a drill can never touch the real bot's position.
+Explicit environment variables always win, any other profile name fails fast at
+startup, and nothing here needs a bot token, Telegram credentials, or Testnet.
+
+```bash
+npm run mock:rpc                        # serve the fixture scenario on 127.0.0.1:8420
+npm run scan:mock                       # scanner --mock: decode the scenario, no credentials
+npm run mock:poll                       # dry run: mock RPC + real poller, sends are logged
+npm run mock:poll -- --fail-events error  # inject in-band JSON-RPC failures
+npm run mock:rpc -- --stale-cursor      # reject cursors once the poller has one
+npm run mock:poll -- --malformed        # append an undecodable event (must skip, not crash)
+npm run mock:poll -- --port 0           # ephemeral port (any entry point accepts it)
+```
+
+Failure kinds are `error`, `http-500`, `rate-limit`, and `stale-cursor`, with
+the shorthands `--fail-rpc`, `--rate-limit`, `--stale-cursor` for `getEvents`
+and `--fail-health <kind>` for `getHealth`. The mock enforces the real RPC's
+request rules — mutually exclusive `startLedger`/`cursor`, the retained floor as
+an error rather than an empty page, bounded error messages — and the dry run
+exercises the poller's cursor-safety, restart, and bounded-log guarantees end to
+end. `npm test` covers all of it (`tests/mock-*.test.mjs`); run just those with
+`npm run test:mock`.
 
 ## How the polling works
 
@@ -129,6 +189,35 @@ Events are also not a source of truth for current state — a claim's stakes and
 status come from the contract's own getters. This bot is a timeline, not an
 index.
 
+## Decoder compatibility contract
+
+The decoder is deliberately forward-compatible at the event boundary:
+
+- Soroban event topics are read in declaration order, and non-topic fields are
+  read from the event value map using their deployed snake_case names.
+- A known event with a malformed topic, value, address, integer, or XDR value
+  becomes an `unknown` event. `decodeEvent` never throws into the poller, so one
+  bad event cannot stop a scan or move a cursor based on a partial payload.
+- Events that are valid on-chain but unknown to this version are retained as
+  `unknown` for bounded logs and are skipped for Telegram. They are not
+  invented, retried, or treated as current contract state.
+- Amounts remain `bigint` atomic USDC values until formatting; no floating-point
+  conversion is used. Contract strings are clipped at the notification and
+  diagnostic boundaries, and scanner output is bounded.
+
+The compatibility promise is for the deployed event wire shape and the public
+decoded payload names above, not for arbitrary XDR or future contract fields.
+Adding an optional field is safe when the existing fields retain their names
+and types. Renaming a topic or changing a field type is a decoder compatibility
+change and must be deployed together with a recorded fixture and an operational
+note. The chain remains authoritative if the bot version cannot decode an event.
+
+RPC configuration is read-only: `STELLAR_RPC_URL` must point to a Soroban RPC
+endpoint, and `STELLAR_NETWORK_PASSPHRASE` controls network labeling for
+explorer links. The client sends no signing material and creates no wallet.
+Explorer path components are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL`
+values are supported without changing cursor or decoder compatibility.
+
 ## Cursor persistence
 
 The poller writes its resume position to `data/cursor.json` (write-then-rename,
@@ -146,7 +235,13 @@ so a crash mid-write cannot truncate it):
 ```
 
 On a cold start (no file) it begins `START_LOOKBACK_LEDGERS` behind the chain tip
-rather than replaying the whole retained window into your chat.
+rather than replaying the whole retained window into your chat. `/pause` and
+`/resume` never edit this file; they only control scheduling, so the cursor
+format remains version 1 and a restart does not preserve a pause.
+
+Tests never use this directory: they run against an ephemeral data directory
+created under the OS temp dir and removed afterwards (see
+[docs/contributor-fixtures.md](docs/contributor-fixtures.md)).
 
 ### Restart gaps
 
@@ -184,11 +279,18 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 
 - **A failed RPC call** fails one contract's scan for one cycle. Its cursor is
   left untouched, so the next cycle resumes exactly where it stopped.
-- **A failed Telegram send** drops one message; the cursor still advances. That
-  is deliberate: holding the cursor back would turn a revoked token or a chat
-  the bot was removed from into an infinite replay, and recovery would flood the
-  channel. Notifications are lossy on purpose — the chain is the record.
-- **A corrupt cursor file** is treated as a cold start rather than a crash.
+- **A partial notification batch** commits the opaque RPC cursor after the
+  returned page has been processed. Unknown events, events beyond
+  `MAX_NOTIFICATIONS_PER_CYCLE`, and sends that exhaust three bounded retries
+  are counted as skipped or failed and are not replayed. Holding the cursor
+  back would turn a revoked token or removed chat into an infinite replay, and
+  recovery would flood the channel. Notifications are lossy on purpose — the
+  chain is the record; the poller logs the sent/failed/skipped commit decision.
+- **A corrupt cursor file** is treated as a cold start rather than a crash. A
+  valid but RPC-rejected stale cursor is never silently rewound: the target keeps
+  that cursor, the error becomes visible in `/status`, and scheduled retries or
+  `/resume` use the same position. Recovery follows the incident runbook rather
+  than replacing an opaque cursor with a guessed ledger.
 - **A cursor that has fallen below the RPC's retained window** (a restart longer
   than the window) is detected against the floor, reported once, and reset to a
   cold start — see [Restart gaps](#restart-gaps). The events in that gap are
@@ -196,7 +298,41 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   cursor forever.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
-  down.
+  down. RPC, Telegram, and poller error text shown in `/status` or logs is
+  compact, bounded, and the configured bot token is redacted.
+- **An operator pause** prevents new cycles but cannot cancel a bounded scan or
+  Telegram retry loop already in progress. That cycle follows the normal cursor
+  rules above; `/resume` starts the next cycle immediately.
+
+## Long-running operation
+
+The notifier is meant to run for weeks through Stellar RPC and Telegram outages.
+Everything it keeps in memory is fixed-size or capped:
+
+- Per-target state is two small records (cursor, last event ledger, last error).
+- A scan walks at most 20 event pages, and each cycle sends at most
+  `MAX_NOTIFICATIONS_PER_CYCLE` messages; the rest are counted as skipped.
+- Error text is redacted (bot token) and clipped before it reaches `/status`,
+  `/health`, or logs; unknown or malformed events are logged as one bounded line.
+- At most one poll timer is pending, and `stop()` leaves none behind.
+
+`tests/soak.test.mjs` enforces this offline: it drives about 1,700 poll cycles
+through a scripted fake RPC (outages, stale-cursor rejections, malformed and
+unknown events) with every Telegram send failing, under mocked timers. It asserts
+that heap growth after a forced GC stays under 4 MB, that status and every log
+line stay bounded and token-free, and that timers do not accumulate. A control
+test deliberately leaks per send and must trip the same threshold, so the check
+cannot silently stop working. It needs no Testnet, Telegram credentials, or keys.
+
+**Deployment assumptions:** one process per chat and cursor file (two writers
+would race on `CURSOR_FILE`), the cursor path on persistent storage, and a
+supervisor that restarts the process and probes `GET /health`. If you suspect a
+leak in production, watch the process RSS over days; a restart is always safe.
+
+**Rollback:** deploy the previous build and start it against the same
+`CURSOR_FILE`. The cursor format is unchanged (version 1) and the chain is the
+source of truth, so nothing is replayed beyond the last saved cursor and nothing
+needs migrating. Keep a copy of the cursor file if you want an exact resume point.
 
 ## Health endpoint
 
@@ -205,7 +341,7 @@ checks (default `http://127.0.0.1:8787`):
 
 | Path | Meaning |
 | --- | --- |
-| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy; `503` when stopped or degraded (repeated RPC failures or a stale success window). |
+| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused`. |
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
 The JSON body is operational status only: poller counters, ledgers, truncated
@@ -214,7 +350,7 @@ includes `BOT_TOKEN`, chat ids, private keys, or unbounded remote payloads.
 
 Configuration (see `.env.example`):
 
-- `HEALTH_HOST` — bind address (default `127.0.0.1`)
+- `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
 
@@ -231,21 +367,47 @@ errors are logged and ignored so they cannot stop the notifier.
 ```
 src/
   index.ts                 entry point: config -> RPC -> bot -> poller -> health HTTP
+  mock-run.ts              dry run: in-process mock RPC + real poller, log-only sends
   health.ts                local loopback GET /health for supervisors
-  config.ts                env loading and validation, fails fast
-  bot.ts                   grammy setup: /start, /help, /status, /contracts
+  config.ts                env loading and validation, fails fast (MIMIR_PROFILE profiles)
+  bot.ts                   grammy setup: /start, /help, /status, /contracts, operator pause/resume
   poller.ts                the loop: scan, notify, persist the cursor
   stellar/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
     decode.ts              typed decoding of both contracts' events
+    mock-rpc.ts            local Soroban mock: scenario, pagination, failure injection
+    mock-constants.ts      mock profile fixture ids, ports, placeholder credentials
   notifications/
     format.ts              decoded event -> MarkdownV2 message
 ```
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic format, fixture, and poller restart-gap suites, or `npm run build` to produce the production output.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, restart-gap, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+
+### Lockfile reproducibility
+
+`package-lock.json` is the install of record: deployments rebuild with `npm ci`,
+so the committed lockfile must stay in sync with `package.json` and pin exactly
+what it claims. Two checks enforce that, and CI runs both after `npm ci`:
+
+- `npm run lockfile:check` — offline. The lockfile is `lockfileVersion` 3, its
+  root entry matches `package.json`'s dependency ranges exactly, every package
+  resolves to a `registry.npmjs.org` tarball with a `sha512` integrity hash, and
+  every direct dependency is pinned at the top level. Drift is reported by
+  package name instead of being silently re-resolved.
+- `npm run lockfile:reproduce` — asks npm to regenerate the lockfile from itself
+  in a scratch directory and fails if the resolved package set changes, so a
+  hand-edited or partially-resolved lockfile cannot land. The repository working
+  tree is never written to.
+
+The offline suite runs as part of `npm test` (`tests/lockfile.test.mjs`), so
+drift is caught locally without network access. To change dependencies, edit
+`package.json`, run `npm install` to regenerate the lockfile, and commit both
+files together — a lockfile that no longer matches `package.json` fails
+`npm ci`, `npm run lockfile:check`, and CI.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile and health suites (`npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
 

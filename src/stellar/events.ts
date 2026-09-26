@@ -81,9 +81,14 @@ export interface RawScan {
  * discover the cursor stopped moving.
  */
 export function eventCursorLedger(cursor: string): number | null {
+  if (typeof cursor !== "string") return null;
   const toid = cursor.split("-")[0];
   if (!toid || !/^\d+$/.test(toid)) return null;
-  return Number(BigInt(toid) >> 32n);
+  try {
+    return Number(BigInt(toid) >> 32n);
+  } catch {
+    return null;
+  }
 }
 
 export async function paginatedGetEvents(
@@ -125,8 +130,9 @@ export async function paginatedGetEvents(
           limit,
         });
 
-    events.push(...response.events);
-    latestLedger = response.latestLedger;
+    const rawEvents = Array.isArray(response?.events) ? response.events : [];
+    events.push(...rawEvents);
+    latestLedger = response?.latestLedger ?? latestLedger;
 
     const nextCursor = response.cursor || "";
     // Out of cursor, or the server stopped moving: nothing left to read.
@@ -194,14 +200,122 @@ export async function readContractEvents(
 //   npm run scan -- --pages 40    # walk further
 //   npm run scan -- --show 5      # print 5 decoded events per contract
 //   npm run scan -- --from 123456 # explicit start ledger
+//   npm run scan -- --json        # machine-readable JSON on stdout (progress on stderr)
 //
 // Needs no BOT_TOKEN: the public Testnet RPC is unauthenticated, so this reads
 // live chain data with nothing but the contract ids.
+//
+// `--json` prints one mimir-scan-v1 document to stdout so the scan can be piped
+// into jq / CI. Progress and errors go to stderr so they never corrupt the JSON.
+//   npm run scan -- --mock        # local mock profile: no network, no credentials
+//
+// Needs no BOT_TOKEN: the public Testnet RPC is unauthenticated, so this reads
+// live chain data with nothing but the contract ids. `--mock` instead points
+// the same reader at a local mock Soroban RPC (`npm run mock:rpc`), selecting
+// the `MIMIR_PROFILE=mock` defaults for anything the environment leaves unset.
 
 function flag(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`);
   if (index === -1) return undefined;
   return process.argv[index + 1];
+}
+
+/** True when `--name` appears anywhere in argv (boolean CLI switches). */
+export function hasFlag(name: string): boolean {
+  return process.argv.includes(`--${name}`);
+}
+
+/** JSON.stringify replacer: bigint becomes a decimal string (never leaked as Number). */
+export function scanJsonReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === "bigint") return value.toString();
+  return value;
+}
+
+export interface ScanJsonEvent {
+  ledger: number;
+  txHash: string;
+  eventId: string;
+  summary: string;
+  /** Decoded payload; bigints serialize as decimal strings via {@link scanJsonReplacer}. */
+  payload: DecodedEvent["payload"];
+}
+
+export interface ScanJsonTarget {
+  source: ContractSource;
+  contractId: string;
+  pages: number;
+  eventCount: number;
+  truncated: boolean;
+  lastEventLedger: number | null;
+  cursor: string | null;
+  histogram: Record<string, number>;
+  /** Last N decoded events (controlled by `--show`); never includes secrets. */
+  events: ScanJsonEvent[];
+}
+
+export interface ScanJsonReport {
+  format: "mimir-scan-v1";
+  network: string;
+  rpcUrl: string;
+  ledgers: { oldest: number; latest: number };
+  targets: ScanJsonTarget[];
+}
+
+/** Event-name histogram used by both the human CLI and JSON report. */
+export function eventHistogram(events: DecodedEvent[]): Record<string, number> {
+  const counts = new Map<string, number>();
+  for (const event of events) {
+    const key =
+      event.payload.name === "unknown"
+        ? `unknown:${event.payload.eventName || "?"}`
+        : event.payload.name;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return Object.fromEntries([...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])));
+}
+
+/** Build one contract's JSON target from a completed {@link ContractScan}. */
+export function buildScanJsonTarget(scan: ContractScan, show: number): ScanJsonTarget {
+  const limit = Number.isFinite(show) && show > 0 ? Math.floor(show) : 0;
+  return {
+    source: scan.source,
+    contractId: scan.contractId,
+    pages: scan.pages,
+    eventCount: scan.events.length,
+    truncated: scan.truncated,
+    lastEventLedger: scan.lastEventLedger,
+    cursor: scan.cursor,
+    histogram: eventHistogram(scan.events),
+    // slice(-0) would return everything, so show=0 must be special-cased
+    events: (limit > 0 ? scan.events.slice(-limit) : []).map((event) => ({
+      ledger: event.ledger,
+      txHash: event.txHash,
+      eventId: event.eventId,
+      summary: summarize(event),
+      payload: event.payload,
+    })),
+  };
+}
+
+export function buildScanJsonReport(input: {
+  network: string;
+  rpcUrl: string;
+  oldestLedger: number;
+  latestLedger: number;
+  targets: ScanJsonTarget[];
+}): ScanJsonReport {
+  return {
+    format: "mimir-scan-v1",
+    network: input.network,
+    rpcUrl: input.rpcUrl,
+    ledgers: { oldest: input.oldestLedger, latest: input.latestLedger },
+    targets: input.targets,
+  };
+}
+
+/** Pretty-printed JSON document ending in a newline (safe to pipe). */
+export function formatScanJson(report: ScanJsonReport): string {
+  return JSON.stringify(report, scanJsonReplacer, 2) + "\n";
 }
 
 function summarize(event: DecodedEvent): string {
@@ -233,53 +347,97 @@ function summarize(event: DecodedEvent): string {
   }
 }
 
+function boundedJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => {
+    if (typeof item !== "string") return typeof item === "bigint" ? item.toString() : item;
+    const compact = item.replace(/\s+/g, " ").trim();
+    return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
+  });
+}
+
 async function main(): Promise<void> {
+  // `--mock` opts into the local mock profile before config is read. An
+  // explicit MIMIR_PROFILE in the environment still wins; blank counts as unset.
+  if (process.argv.includes("--mock") && !process.env.MIMIR_PROFILE?.trim()) {
+    process.env.MIMIR_PROFILE = "mock";
+  }
+
   const config = loadStellarConfig();
   const server = createRpcServer(config);
   const pages = Number(flag("pages") ?? EVENT_MAX_PAGES);
   const show = Number(flag("show") ?? 3);
   const from = flag("from");
+  const asJson = hasFlag("json");
 
   const health = await server.getHealth();
-  console.log(`RPC        ${config.rpcUrl} (${networkLabel(config)})`);
-  console.log(`ledgers    oldest=${health.oldestLedger} latest=${health.latestLedger}`);
+  const network = networkLabel(config);
+
+  // When `--json` is set, stdout is reserved for one JSON document. Progress
+  // goes to stderr so piping (`npm run scan -- --json | jq`) stays valid.
+  const progress = asJson ? console.error.bind(console) : console.log.bind(console);
+
+  if (!asJson) {
+    console.log(`RPC        ${config.rpcUrl} (${network})`);
+    console.log(`ledgers    oldest=${health.oldestLedger} latest=${health.latestLedger}`);
+  } else {
+    progress(
+      `scanning ${network} ledgers oldest=${health.oldestLedger} latest=${health.latestLedger}`,
+    );
+  }
 
   const targets: WatchTarget[] = [
     { source: "market", contractId: config.marketContractId },
     { source: "squad", contractId: config.squadContractId },
   ];
 
+  const jsonTargets: ScanJsonTarget[] = [];
+
   for (const target of targets) {
-    console.log(`\n=== ${target.source}  ${target.contractId} ===`);
+    if (!asJson) {
+      console.log(`\n=== ${target.source}  ${target.contractId} ===`);
+    }
+
     const scan = await readContractEvents(server, target, {
       maxPages: pages,
       startLedger: from ? Number(from) : health.oldestLedger,
     });
 
-    const counts = new Map<string, number>();
-    for (const event of scan.events) {
-      const key =
-        event.payload.name === "unknown"
-          ? `unknown:${event.payload.eventName || "?"}`
-          : event.payload.name;
-      counts.set(key, (counts.get(key) ?? 0) + 1);
+    if (asJson) {
+      jsonTargets.push(buildScanJsonTarget(scan, show));
+      progress(
+        `scanned ${target.source}: events=${scan.events.length} pages=${scan.pages} truncated=${scan.truncated}`,
+      );
+      continue;
     }
+
+    const counts = eventHistogram(scan.events);
 
     console.log(
       `pages=${scan.pages} events=${scan.events.length} truncated=${scan.truncated} ` +
         `lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor}`,
     );
-    for (const [name, count] of [...counts].sort((a, b) => b[1] - a[1])) {
+    for (const [name, count] of Object.entries(counts)) {
       console.log(`  ${count.toString().padStart(4)}  ${name}`);
     }
 
-    for (const event of scan.events.slice(-show)) {
+    for (const event of show > 0 ? scan.events.slice(-show) : []) {
       console.log(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
       console.log(`  ${summarize(event)}`);
       console.log(
-        `  ${JSON.stringify(event.payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v))}`,
+        `  ${boundedJson(event.payload)}`,
       );
     }
+  }
+
+  if (asJson) {
+    const report = buildScanJsonReport({
+      network,
+      rpcUrl: config.rpcUrl,
+      oldestLedger: health.oldestLedger,
+      latestLedger: health.latestLedger,
+      targets: jsonTargets,
+    });
+    process.stdout.write(formatScanJson(report));
   }
 }
 

@@ -92,27 +92,67 @@ export type MarketPayload =
   | { name: "withdrawal"; to: string; amount: bigint }
   | { name: "withdrawal_pending"; to: string; amount: bigint };
 
+export type SquadMarketCreatedPayload = {
+  name: "market_created";
+  marketId: number;
+  captain: string;
+  deadline: number;
+  feeBps: number;
+  question: string;
+};
+
+export type SquadDepositedPayload = {
+  name: "deposited";
+  marketId: number;
+  side: number;
+  participant: string;
+  amount: bigint;
+  shares: bigint;
+};
+
+export type SquadWithdrawnPayload = {
+  name: "withdrawn";
+  marketId: number;
+  side: number;
+  participant: string;
+  amount: bigint;
+};
+
+export type SquadResolvedPayload = {
+  name: "resolved";
+  marketId: number;
+  result: number;
+  poolA: bigint;
+  poolB: bigint;
+};
+
+export type SquadClaimedPayload = {
+  name: "claimed";
+  marketId: number;
+  participant: string;
+  gross: bigint;
+  fee: bigint;
+  net: bigint;
+};
+
+export type SquadFeesClaimedPayload = {
+  name: "fees_claimed";
+  recipient: string;
+  amount: bigint;
+};
+
 export type SquadPayload =
-  | {
-      name: "market_created";
-      marketId: number;
-      captain: string;
-      deadline: number;
-      feeBps: number;
-      question: string;
-    }
-  | {
-      name: "deposited";
-      marketId: number;
-      side: number;
-      participant: string;
-      amount: bigint;
-      shares: bigint;
-    }
-  | { name: "withdrawn"; marketId: number; side: number; participant: string; amount: bigint }
-  | { name: "resolved"; marketId: number; result: number; poolA: bigint; poolB: bigint }
-  | { name: "claimed"; marketId: number; participant: string; gross: bigint; fee: bigint; net: bigint }
-  | { name: "fees_claimed"; recipient: string; amount: bigint };
+  | SquadMarketCreatedPayload
+  | SquadDepositedPayload
+  | SquadWithdrawnPayload
+  | SquadResolvedPayload
+  | SquadClaimedPayload
+  | SquadFeesClaimedPayload;
+
+export type SquadEvent = EventMeta & {
+  source: "squad";
+  payload: SquadPayload | UnknownPayload;
+};
 
 /**
  * Anything this bot has no notification for: admin events (`oracle_changed`,
@@ -127,7 +167,54 @@ export interface UnknownPayload {
 
 export type EventPayload = MarketPayload | SquadPayload | UnknownPayload;
 
-export type DecodedEvent = EventMeta & { payload: EventPayload };
+export type ClaimCreatedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_created" }> };
+export type ClaimChallengedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_challenged" }> };
+export type ClaimResolvedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_resolved" }> };
+export type ClaimCancelledEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_cancelled" }> };
+export type MarketSettledEvent = EventMeta & { payload: Extract<MarketPayload, { name: "market_settled" }> };
+export type ChallengerPaidEvent = EventMeta & { payload: Extract<MarketPayload, { name: "challenger_paid" }> };
+export type FeeClaimedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "fee_claimed" }> };
+export type WithdrawalEvent = EventMeta & { payload: Extract<MarketPayload, { name: "withdrawal" }> };
+export type WithdrawalPendingEvent = EventMeta & { payload: Extract<MarketPayload, { name: "withdrawal_pending" }> };
+
+export type SquadMarketCreatedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "market_created" }> };
+export type SquadDepositedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "deposited" }> };
+export type SquadWithdrawnEvent = EventMeta & { payload: Extract<SquadPayload, { name: "withdrawn" }> };
+export type SquadResolvedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "resolved" }> };
+export type SquadClaimedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "claimed" }> };
+export type SquadFeesClaimedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "fees_claimed" }> };
+
+export type UnknownMarketEvent = EventMeta & { payload: UnknownPayload };
+
+export type MarketEvent =
+  | ClaimCreatedEvent
+  | ClaimChallengedEvent
+  | ClaimResolvedEvent
+  | ClaimCancelledEvent
+  | MarketSettledEvent
+  | ChallengerPaidEvent
+  | FeeClaimedEvent
+  | WithdrawalEvent
+  | WithdrawalPendingEvent
+  | SquadMarketCreatedEvent
+  | SquadDepositedEvent
+  | SquadWithdrawnEvent
+  | SquadResolvedEvent
+  | SquadClaimedEvent
+  | SquadFeesClaimedEvent
+  | UnknownMarketEvent;
+
+export type DecodedEvent = MarketEvent;
+
+/** Keep decoder diagnostics useful without copying an unbounded RPC payload. */
+const MAX_DIAGNOSTIC_LENGTH = 200;
+
+function diagnostic(value: unknown): string {
+  const compact = String(value).replace(/\s+/g, " ").trim() || "unknown error";
+  return compact.length <= MAX_DIAGNOSTIC_LENGTH
+    ? compact
+    : `${compact.slice(0, MAX_DIAGNOSTIC_LENGTH - 1)}…`;
+}
 
 // ── Scalar helpers ───────────────────────────────────────────────────────────
 
@@ -148,9 +235,21 @@ function big(value: unknown, what: string): bigint {
   throw new DecodeError(`${what}: expected an integer, got ${typeof value}`);
 }
 
+/** Reject negative amounts, returning non-negative bigint. */
+function amount(value: unknown, what: string): bigint {
+  const b = big(value, what);
+  if (b < 0n) {
+    throw new DecodeError(`${what}: expected non-negative amount, got ${b}`);
+  }
+  return b;
+}
+
 /** For ids, deadlines and bps — small enough that `number` is honest. */
 function num(value: unknown, what: string): number {
   const asBig = big(value, what);
+  if (asBig < 0n) {
+    throw new DecodeError(`${what}: expected non-negative integer, got ${asBig}`);
+  }
   if (asBig > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new DecodeError(`${what}: ${asBig} exceeds the safe integer range`);
   }
@@ -211,7 +310,7 @@ function decodeMarket(
           topicAt(topics, 2, "claim_challenged.challenger"),
           "claim_challenged.challenger",
         ),
-        stake: big(fields.stake, "claim_challenged.stake"),
+        stake: amount(fields.stake, "claim_challenged.stake"),
       };
 
     case "claim_resolved":
@@ -234,10 +333,10 @@ function decodeMarket(
       return {
         name,
         claimId: num(topicAt(topics, 1, "market_settled.id"), "market_settled.id"),
-        totalPaid: big(fields.total_paid, "market_settled.total_paid"),
-        totalFees: big(fields.total_fees, "market_settled.total_fees"),
-        owedToChallengers: big(fields.owed_to_challengers, "market_settled.owed_to_challengers"),
-        dust: big(fields.dust, "market_settled.dust"),
+        totalPaid: amount(fields.total_paid, "market_settled.total_paid"),
+        totalFees: amount(fields.total_fees, "market_settled.total_fees"),
+        owedToChallengers: amount(fields.owed_to_challengers, "market_settled.owed_to_challengers"),
+        dust: amount(fields.dust, "market_settled.dust"),
       };
 
     case "challenger_paid":
@@ -248,17 +347,17 @@ function decodeMarket(
           topicAt(topics, 2, "challenger_paid.challenger"),
           "challenger_paid.challenger",
         ),
-        stake: big(fields.stake, "challenger_paid.stake"),
-        gross: big(fields.gross, "challenger_paid.gross"),
-        fee: big(fields.fee, "challenger_paid.fee"),
-        net: big(fields.net, "challenger_paid.net"),
+        stake: amount(fields.stake, "challenger_paid.stake"),
+        gross: amount(fields.gross, "challenger_paid.gross"),
+        fee: amount(fields.fee, "challenger_paid.fee"),
+        net: amount(fields.net, "challenger_paid.net"),
       };
 
     case "fee_claimed":
       return {
         name,
         recipient: addr(topicAt(topics, 1, "fee_claimed.recipient"), "fee_claimed.recipient"),
-        amount: big(fields.amount, "fee_claimed.amount"),
+        amount: amount(fields.amount, "fee_claimed.amount"),
       };
 
     case "withdrawal":
@@ -266,7 +365,7 @@ function decodeMarket(
       return {
         name,
         to: addr(topicAt(topics, 1, `${name}.to`), `${name}.to`),
-        amount: big(fields.amount, `${name}.amount`),
+        amount: amount(fields.amount, `${name}.amount`),
       };
 
     default:
@@ -298,8 +397,8 @@ function decodeSquad(
         marketId: num(topicAt(topics, 1, "deposited.market_id"), "deposited.market_id"),
         side: num(topicAt(topics, 2, "deposited.side"), "deposited.side"),
         participant: addr(topicAt(topics, 3, "deposited.participant"), "deposited.participant"),
-        amount: big(fields.amount, "deposited.amount"),
-        shares: big(fields.shares, "deposited.shares"),
+        amount: amount(fields.amount, "deposited.amount"),
+        shares: amount(fields.shares, "deposited.shares"),
       };
 
     case "withdrawn":
@@ -308,7 +407,7 @@ function decodeSquad(
         marketId: num(topicAt(topics, 1, "withdrawn.market_id"), "withdrawn.market_id"),
         side: num(topicAt(topics, 2, "withdrawn.side"), "withdrawn.side"),
         participant: addr(topicAt(topics, 3, "withdrawn.participant"), "withdrawn.participant"),
-        amount: big(fields.amount, "withdrawn.amount"),
+        amount: amount(fields.amount, "withdrawn.amount"),
       };
 
     case "resolved":
@@ -316,8 +415,8 @@ function decodeSquad(
         name,
         marketId: num(topicAt(topics, 1, "resolved.market_id"), "resolved.market_id"),
         result: num(fields.result, "resolved.result"),
-        poolA: big(fields.pool_a, "resolved.pool_a"),
-        poolB: big(fields.pool_b, "resolved.pool_b"),
+        poolA: amount(fields.pool_a, "resolved.pool_a"),
+        poolB: amount(fields.pool_b, "resolved.pool_b"),
       };
 
     case "claimed":
@@ -325,16 +424,16 @@ function decodeSquad(
         name,
         marketId: num(topicAt(topics, 1, "claimed.market_id"), "claimed.market_id"),
         participant: addr(topicAt(topics, 2, "claimed.participant"), "claimed.participant"),
-        gross: big(fields.gross, "claimed.gross"),
-        fee: big(fields.fee, "claimed.fee"),
-        net: big(fields.net, "claimed.net"),
+        gross: amount(fields.gross, "claimed.gross"),
+        fee: amount(fields.fee, "claimed.fee"),
+        net: amount(fields.net, "claimed.net"),
       };
 
     case "fees_claimed":
       return {
         name,
         recipient: addr(topicAt(topics, 1, "fees_claimed.recipient"), "fees_claimed.recipient"),
-        amount: big(fields.amount, "fees_claimed.amount"),
+        amount: amount(fields.amount, "fees_claimed.amount"),
       };
 
     default:
@@ -346,6 +445,7 @@ function decodeSquad(
 
 /** `event.contractId` is a `Contract` on some SDK paths and a string on others. */
 function contractIdOf(event: rpc.Api.EventResponse): string {
+  if (!event || typeof event !== "object") return "";
   const raw: unknown = (event as { contractId?: unknown }).contractId;
   if (typeof raw === "string") return raw;
   if (raw && typeof raw === "object") {
@@ -367,15 +467,20 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
   const meta: EventMeta = {
     source,
     contractId: contractIdOf(event),
-    ledger: Number(event.ledger ?? 0),
-    txHash: event.txHash ?? "",
-    at: Math.floor(new Date(event.ledgerClosedAt ?? 0).getTime() / 1000),
-    eventId: event.id ?? "",
+    ledger: Number(event?.ledger ?? 0),
+    txHash: event?.txHash ?? "",
+    at: Math.floor(new Date(event?.ledgerClosedAt ?? 0).getTime() / 1000),
+    eventId: event?.id ?? "",
   };
 
   let eventName = "";
   try {
-    const topics = (event.topic ?? []).map((t) => {
+    if (!event || typeof event !== "object") {
+      throw new DecodeError("invalid or missing event object");
+    }
+
+    const rawTopics = Array.isArray(event.topic) ? event.topic : [];
+    const topics = rawTopics.map((t) => {
       try {
         return native(t);
       } catch {
@@ -386,7 +491,17 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     const first = topics[0];
     eventName = typeof first === "string" ? first : "";
 
-    const decodedValue = native(event.value);
+    let decodedValue: unknown = undefined;
+    if (event.value !== undefined && event.value !== null) {
+      try {
+        decodedValue = native(event.value);
+      } catch (err) {
+        throw new DecodeError(
+          `malformed event value XDR: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
     const fields = isRecord(decodedValue) ? decodedValue : {};
 
     const payload =
@@ -394,7 +509,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
         ? decodeMarket(eventName, topics, fields)
         : decodeSquad(eventName, topics, fields);
 
-    if (payload) return { ...meta, payload };
+    if (payload) return { ...meta, payload } as DecodedEvent;
     return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
   } catch (err) {
     return {
@@ -402,7 +517,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
       payload: {
         name: "unknown",
         eventName,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: diagnostic(err instanceof Error ? err.message : err),
       },
     };
   }

@@ -37,6 +37,9 @@ export interface HealthReport {
   checkedAt: string;
   poller: {
     running: boolean;
+    /** Intentional operator pause; process is ready but scheduling is stopped. */
+    paused: boolean;
+    channelPreviewMode: boolean;
     cycles: number;
     lastPollAt: string | null;
     lastSuccessAt: string | null;
@@ -109,6 +112,9 @@ export function buildHealthReport(
   let status: HealthReport["status"];
   if (!poller.running) {
     status = "stopped";
+  } else if (poller.paused) {
+    // A deliberate operator pause is healthy, not a stale or failing poller.
+    status = "ok";
   } else {
     const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(config.pollIntervalMs, 1)));
     const tooManyFailures = poller.consecutiveFailures >= failureBudget;
@@ -129,6 +135,8 @@ export function buildHealthReport(
     checkedAt: new Date(nowMs).toISOString(),
     poller: {
       running: poller.running,
+      paused: poller.paused === true,
+      channelPreviewMode: config.channelPreviewMode === true,
       cycles: poller.cycles,
       lastPollAt: iso(poller.lastPollAt),
       lastSuccessAt: iso(poller.lastSuccessAt),
