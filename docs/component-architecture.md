@@ -76,8 +76,9 @@ The poller is the central orchestrator that runs a recurring loop to scan contra
 - **Status reporting**: Maintains counters and last-error information
 
 **State management:**
-- Per-target state: `cursor` (opaque string), `lastEventLedger` (number), `lastError` (string)
-- Global counters: `cycles`, `notificationsSent`, `notificationsFailed`, `eventsSkipped`, `consecutiveFailures`
+- Per-target state: `cursor` (opaque string), `lastEventLedger` (number), `rewindFromLedger` (the retained floor a stale cursor is being recovered from, else `null`), `lastError` (string)
+- Global counters: `cycles`, `notificationsSent`, `notificationsFailed`, `eventsSkipped`, `cursorRewinds`, `consecutiveFailures`
+- Chain clock: `chainClockAt`, the newest close time actually observed (monotonic, persisted with the cursors); skew is derived as `now - chainClockAt`
 
 ### Scanner (`src/stellar/events.ts`)
 
@@ -87,6 +88,7 @@ The scanner handles cursor-paginated event retrieval from Soroban RPC. It is des
 - **Sequential pagination**: Uses opaque cursors; cannot parallelize
 - **Mutual exclusion**: `startLedger`/`endLedger` and `cursor` are mutually exclusive in requests
 - **Retention awareness**: Queries `getHealth()` to get the retained-history floor
+- **Window validation**: The floor and tip are validated before the first request; a start ledger below the floor is clamped up, and a start ledger above the tip or a resume cursor above the tip is refused with a bounded error. A cursor below the floor is still forwarded, so retention stays the RPC's call — and when the RPC rejects it as stale, the poller may rewind to the floor (see [Stale Cursor](#stale-cursor))
 - **Page termination**: Walk stops when cursor stops moving or reaches chain tip
 - **Bounded scanning**: Limited to `EVENT_MAX_PAGES` (20) pages per scan
 
@@ -127,7 +129,7 @@ The bot uses grammy for Telegram integration with a thin command layer and a sin
 
 **Command handlers:**
 - `/start`, `/help`: Bot information and command list
-- `/status`: Poller state, cursors, counters, last error
+- `/status`: Poller state, chain clock skew, cursors, counters, last error
 - `/health`: Health assessment and operational readiness
 - `/contracts`: Contract IDs and explorer links
 - `/preview`: Preview notification formatting
@@ -151,9 +153,19 @@ Local HTTP endpoint for process supervisors and deploy checks. Bound to loopback
 - **degraded**: Poller running but stale or failing repeatedly
 - **stopped**: Poller not running
 
+**Chain clock:**
+- `poller.chainClockAt`: newest observed chain close time (ISO 8601), or `null`
+- `poller.chainClockSkewMs`: `checkedAt - chainClockAt` in milliseconds; positive while the bot is ahead of the chain, `null` before the first observation
+
+**Configuration provenance:**
+- `config`: each setting's name and the source that supplied it (`process-env`, `env-file`, `profile-default`, `built-in-default`, `derived`, `unset`), plus per-source counts and actionable warnings
+- Values are never included, secret or not, so the section is safe to publish; `secret: true` marks which settings are sensitive
+- The boot log prints the same report as one line (`formatProvenanceSummary`)
+
 **Safety:**
 - JSON-only responses
 - No bot tokens, private keys, or unbounded payloads
+- No configuration values of any kind, only names and origins
 - Client errors logged and ignored
 
 ### RPC Client (`src/stellar/client.ts`)
@@ -208,14 +220,33 @@ Load from file → Use in RPC request → Receive new cursor → Process events 
 
 ### Stale Cursor
 
-- **Corrupt file**: Treated as cold start
-- **RPC-rejected cursor**: Kept unchanged; error visible in `/status`
-- **Recovery**: Follow incident runbook, not automatic rewind
+- **Corrupt file**: Quarantined beside the live path and treated as a cold start.
+- **Cursor below the retained floor**: The poller asks `getHealth()` for a fresh
+  window and acts only when the cursor's own ledger places it strictly below
+  `oldestLedger`. It then drops the unreachable cursor and rescans from the floor
+  with `startLedger` (never both `cursor` and `startLedger`, which are mutually
+  exclusive). Everything below the floor was already unreadable, so nothing still
+  retrievable is skipped.
+- **Bounded**: At most `MAX_FLOOR_REWINDS` (3) consecutive automatic rewinds per
+  contract; the budget resets only once a scan returns an in-window cursor. A
+  misbehaving RPC cannot make the poller thrash.
+- **Conservative**: An opaque/unplaceable cursor, an ahead-of-tip cursor, or a
+  window that cannot be read is left untouched, with the bounded RPC error
+  surfaced in `/status`.
+- **Observability**: `cursorRewinds` (global) and the per-target
+  `rewindFromLedger` appear in `/status`, the status snapshot, and `GET /health`;
+  the miss is logged as a bounded ledger count, never a raw payload.
+- **Operator path**: Once the rewind budget is spent, or when the position cannot
+  be placed, recovery follows the incident runbook (a deliberate cold start)
+  rather than further automatic rewinds.
 
 ### Restart Behavior
 
 - **Cold start**: No cursor file → begin `START_LOOKBACK_LEDGERS` behind tip
 - **Resume**: Load cursor file → continue from last persisted position
+- **Mid-recovery resume**: A persisted `rewindFromLedger` resumes the floor walk
+  instead of cold-starting; the field is dropped once the scan returns a fresh
+  resume cursor
 - **Pause state**: Process-local; lost on restart
 
 ### Rate Limits

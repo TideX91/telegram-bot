@@ -9,7 +9,7 @@
  *   - Wrong-type fields
  *   - Oversized strings (clip() in formatEvent)
  *   - Unknown event names (no decoder)
- *   - Admin events that are real but have no notification
+ *   - Admin events that are decoded into structured audit records
  *   - Both market and squad sources
  *   - Helpers: formatUsdc, shortAddress, winnerSideLabel, squadSideLabel
  */
@@ -24,6 +24,8 @@ import {
   shortAddress,
   winnerSideLabel,
   squadSideLabel,
+  isAdminPayload,
+  toAdminAuditRecord,
   USDC_UNIT,
   WINNER_SIDE,
   SQUAD_SIDE,
@@ -172,12 +174,12 @@ test("decodeEvent: unknown event name yields unknown payload with reason=no deco
     ledger: 3,
     txHash: "",
     ledgerClosedAt: "2026-01-01T00:00:00Z",
-    topic: [scStr("oracle_changed"), scStr("something")],
+    topic: [scStr("totally_unknown_event"), scStr("something")],
     value: nativeToScVal({}),
   };
   const result = decodeEvent("market", raw);
   assert.equal(result.payload.name, "unknown");
-  assert.equal(result.payload.eventName, "oracle_changed");
+  assert.equal(result.payload.eventName, "totally_unknown_event");
   assert.equal(result.payload.reason, "no decoder");
 });
 
@@ -412,24 +414,38 @@ test("decodeEvent: squad event with negative amount yields unknown without throw
   assert.match(result.payload.reason, /expected non-negative amount/);
 });
 
-test("decodeEvent: admin market event (oracle_changed) yields unknown/no decoder", () => {
+test("decodeEvent: admin market event (oracle_changed) decodes into admin payload", () => {
   const raw = {
     id: "30-0",
     contractId: "C1",
     ledger: 30,
-    txHash: "",
+    txHash: "aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc00",
     ledgerClosedAt: "2026-01-01T00:00:00Z",
-    // oracle_changed uses an address topic but that's irrelevant — the event is
-    // unrecognised by the decoder regardless of topic contents.
-    topic: [scStr("oracle_changed")],
+    topic: [scStr("oracle_changed"), scAddress(ADDR)],
     value: nativeToScVal({}),
   };
   const result = decodeEvent("market", raw);
-  assert.equal(result.payload.name, "unknown");
-  assert.equal(result.payload.eventName, "oracle_changed");
+  assert.equal(result.payload.name, "oracle_changed");
+  assert.equal(result.payload.newOracle, ADDR);
+  assert.equal(isAdminPayload(result.payload), true);
+
+  const config = {
+    chatId: "-1",
+    marketContractId: "market",
+    squadContractId: "squad",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+  };
+  const audit = toAdminAuditRecord(result, config);
+  assert.ok(audit !== null);
+  assert.equal(audit.type, "oracle_changed");
+  assert.equal(audit.ledger, 30);
+  assert.equal(audit.admin, ADDR);
+  assert.ok(audit.explorerUrl?.includes("aabbcc0011223344556677889900aabbcc0011223344556677889900aabbcc00"));
 });
 
-test("decodeEvent: fee_policy_changed yields unknown/no decoder", () => {
+test("decodeEvent: fee_policy_changed decodes into admin payload", () => {
   const raw = {
     id: "31-0",
     contractId: "C1",
@@ -437,10 +453,64 @@ test("decodeEvent: fee_policy_changed yields unknown/no decoder", () => {
     txHash: "",
     ledgerClosedAt: "2026-01-01T00:00:00Z",
     topic: [scStr("fee_policy_changed")],
-    value: nativeToScVal({}),
+    value: nativeToScVal({ fee_bps: scU32(500) }),
   };
   const result = decodeEvent("market", raw);
-  assert.equal(result.payload.name, "unknown");
+  assert.equal(result.payload.name, "fee_policy_changed");
+  assert.equal(result.payload.feeBps, 500);
+  assert.equal(isAdminPayload(result.payload), true);
+
+  const audit = toAdminAuditRecord(result);
+  assert.ok(audit !== null);
+  assert.equal(audit.type, "fee_policy_changed");
+  assert.equal(audit.details.feeBps, 500);
+});
+
+test("malformed XDR in admin event returns unknown payload with bounded reason without throwing", () => {
+  const malformedAdminEvent = {
+    id: "99-0",
+    contractId: "C1",
+    ledger: 99,
+    txHash: "aabbcc",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("oracle_changed")],
+    value: "not-an-scval-map",
+  };
+
+  let decoded;
+  assert.doesNotThrow(() => {
+    decoded = decodeEvent("market", malformedAdminEvent);
+  });
+  assert.equal(decoded.payload.name, "unknown");
+  assert.equal(decoded.payload.eventName, "oracle_changed");
+  assert.ok(typeof decoded.payload.reason === "string");
+  assert.ok(decoded.payload.reason.length <= 200);
+
+  const validEvent = {
+    id: "100-0",
+    contractId: "C1",
+    ledger: 100,
+    txHash: "aabbcc",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("oracle_changed"), scAddress(ADDR)],
+    value: nativeToScVal({}),
+  };
+  const validDecoded = decodeEvent("market", validEvent);
+  assert.equal(validDecoded.payload.name, "oracle_changed");
+});
+
+test("toAdminAuditRecord returns null for user events", () => {
+  const raw = {
+    id: "10-0",
+    contractId: "C1",
+    ledger: 10,
+    txHash: "",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("claim_created"), scU64(42), scAddress(ADDR)],
+    value: nativeToScVal({ category: "sports" }),
+  };
+  const result = decodeEvent("market", raw);
+  assert.equal(toAdminAuditRecord(result), null);
 });
 
 test("decodeEvent: squad unknown event yields unknown/no decoder", () => {

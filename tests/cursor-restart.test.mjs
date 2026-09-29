@@ -143,7 +143,7 @@ test("cursor round-trip: a cycle persists version 1 and a restart resumes withou
     assert.equal(cursorOf(second, "squad"), "9000-2");
   }));
 
-test("a stale cursor rejected by RPC is kept, surfaced, and does not block the other target", () =>
+test("a stale cursor below the retained floor is rewound while the other target keeps advancing", () =>
   withTempDataDir(async (dir) => {
     const cursorFile = dir.file("cursor.json");
     await writeFile(
@@ -154,16 +154,22 @@ test("a stale cursor rejected by RPC is kept, surfaced, and does not block the o
       }),
       "utf8",
     );
+    // The market contract rejects every scan. The fake window floor is 4000 and
+    // the saved cursor sits at ledger 1, so the poller may safely rewind it.
     const server = fakeServer({ failFor: MARKET_ID, error: new Error(`cursor too old ${TOKEN} ${"z".repeat(2000)}`) });
     const poller = createPoller({ config: baseConfig(cursorFile), server, send: async () => undefined });
     const logs = await captured("error", async () => {
       await poller.start();
-      await waitFor(() => poller.status().lastError !== null && cursorOf(poller, "squad") !== "2-0");
+      await waitFor(() => poller.status().cursorRewinds >= 1 && cursorOf(poller, "squad") !== "2-0");
       poller.stop();
     });
 
     const status = poller.status();
-    assert.equal(cursorOf(poller, "market"), "1-0", "stale cursor is never silently rewound");
+    const market = status.targets.find((t) => t.source === "market");
+    assert.equal(market.cursor, null, "the unreachable cursor is dropped, not guessed at");
+    assert.equal(market.rewindFromLedger, 4000, "the scan resumes from the retained floor");
+    assert.equal(market.cursorStale, true, "health remains alerted until this target scans successfully");
+    assert.equal(status.cursorRewinds, 1, "one bounded rewind is recorded");
     assert.equal(cursorOf(poller, "squad"), "9000-2", "healthy target still advances");
     assert.ok(status.lastError.message.length <= 250);
     assert.equal(status.lastError.message.includes(TOKEN), false);

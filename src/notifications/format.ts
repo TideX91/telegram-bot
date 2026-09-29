@@ -13,12 +13,18 @@
 import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
+  isUsableTxHash,
   shortAddress,
   squadSideLabel,
   winnerSideLabel,
   type DecodedEvent,
 } from "../stellar/decode.js";
 import type { StellarConfig } from "../config.js";
+import {
+  EXPLORER_BUTTON_TEXT,
+  NOTIFICATION_MD,
+  NOTIFICATION_PLAIN,
+} from "../i18n.js";
 
 /** Telegram's MarkdownV2 reserved set. All of it must be escaped, everywhere. */
 const MDV2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
@@ -69,7 +75,10 @@ export function safeErrorMessage(error: unknown, secrets: readonly string[] = []
 
   // Also cover a Telegram token embedded in an upstream error when the
   // caller does not have the configured value (for example in a unit test).
-  message = message.replace(/\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]");
+  message = message.replace(
+    /(?<![A-Za-z0-9_-])\d{6,12}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g,
+    "[REDACTED]",
+  );
 
   const compact = message.replace(/\s+/g, " ").trim() || "unknown error";
   return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
@@ -92,8 +101,62 @@ function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
 
 function footer(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeMd(`ledger ${event.ledger}`);
-  if (!event.txHash || event.txHash.length > MAX_TX_HASH_LENGTH) return `_${ledger}_`;
-  return `_${ledger}_ · [tx](${txExplorerUrl(config, event.txHash)})`;
+  const url = eventExplorerUrl(config, event);
+  if (!url) return `_${ledger}_`;
+  return `_${ledger}_ · [tx](${url})`;
+}
+
+/**
+ * A Stellar transaction hash as returned by the RPC: 64 lowercase or uppercase
+ * hex characters (32 bytes). Anything else is treated as missing — the
+ * notification is still sent, just without an explorer link/button.
+ */
+const TX_HASH_RE = /^[0-9a-fA-F]{64}$/;
+
+/** Explorer URL for an event's transaction, or null when it has none usable. */
+export function eventExplorerUrl(config: StellarConfig, event: DecodedEvent): string | null {
+  // Link only well-formed 64-hex transaction hashes. An externally-derived
+  // identifier that is empty, oversized or malformed gets no link: a broken
+  // explorer link is worse than no link, and the hash itself is never altered here.
+  const raw = event.txHash ?? "";
+  if (raw.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(raw)) return null;
+  const txHash = raw.trim();
+  if (!TX_HASH_RE.test(txHash)) return null;
+  try {
+    const url = txExplorerUrl(config, txHash);
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+export interface ExplorerButton {
+  text: string;
+  url: string;
+}
+
+export interface ExplorerKeyboard {
+  inline_keyboard: ExplorerButton[][];
+}
+
+/**
+ * Telegram inline keyboard for an event notification.
+ *
+ * Returns undefined when the event carries no usable transaction hash, so the
+ * caller sends the existing text-only message unchanged. The button reuses the
+ * same canonical explorer URL as the `· [tx](…)` footer link — the footer stays
+ * as the text fallback, the button is progressive enhancement in the same
+ * Telegram request (no second message, no extra rate-limit cost).
+ */
+export function explorerKeyboard(
+  config: StellarConfig,
+  event: DecodedEvent,
+): ExplorerKeyboard | undefined {
+  const url = eventExplorerUrl(config, event);
+  if (!url) return undefined;
+  return { inline_keyboard: [[{ text: EXPLORER_BUTTON_TEXT, url }]] };
 }
 
 /**
@@ -110,90 +173,114 @@ function headline(event: DecodedEvent): string | null {
   switch (p.name) {
     // ── mimir-market ────────────────────────────────────────────────────────
     case "claim_created":
-      return (
-        `🆕 *New claim* \\#${p.claimId}\n` +
-        `Category: ${escapeMd(clip(p.category))}\n` +
-        `Creator: ${who(p.creator)}`
+      return NOTIFICATION_MD.claimCreated(
+        String(p.claimId),
+        escapeMd(clip(p.category)),
+        who(p.creator),
       );
 
     case "claim_challenged":
-      return (
-        `⚔️ *Claim \\#${p.claimId} challenged*\n` +
-        `Stake: *${usdc(p.stake)}*\n` +
-        `Challenger: ${who(p.challenger)}`
+      return NOTIFICATION_MD.claimChallenged(
+        String(p.claimId),
+        usdc(p.stake),
+        who(p.challenger),
       );
 
     case "claim_resolved":
-      return (
-        `⚖️ *Claim \\#${p.claimId} resolved* — winner: *${escapeMd(winnerSideLabel(p.winnerSide))}*\n` +
-        `Confidence: ${escapeMd(String(p.confidence))}%\n` +
-        (p.summary ? `_${escapeMd(clip(p.summary))}_` : "")
-      ).trimEnd();
+      return NOTIFICATION_MD.claimResolved(
+        String(p.claimId),
+        escapeMd(winnerSideLabel(p.winnerSide)),
+        escapeMd(String(p.confidence)),
+        p.summary ? escapeMd(clip(p.summary)) : null,
+      );
 
     case "claim_cancelled":
-      return `🚫 *Claim \\#${p.claimId} cancelled* — stakes returned`;
+      return NOTIFICATION_MD.claimCancelled(String(p.claimId));
 
     case "market_settled":
-      return (
-        `💰 *Claim \\#${p.claimId} settled*\n` +
-        `Paid out: *${usdc(p.totalPaid)}* · fees ${usdc(p.totalFees)}\n` +
-        `Owed to challengers: ${usdc(p.owedToChallengers)}`
+      return NOTIFICATION_MD.marketSettled(
+        String(p.claimId),
+        usdc(p.totalPaid),
+        usdc(p.totalFees),
+        usdc(p.owedToChallengers),
       );
 
     case "challenger_paid":
-      return (
-        `🏆 *Challenger paid* on claim \\#${p.claimId}\n` +
-        `${who(p.challenger)} staked ${usdc(p.stake)} → net *${usdc(p.net)}*\n` +
-        `Gross ${usdc(p.gross)} · fee ${usdc(p.fee)}`
+      return NOTIFICATION_MD.challengerPaid(
+        String(p.claimId),
+        who(p.challenger),
+        usdc(p.stake),
+        usdc(p.net),
+        usdc(p.gross),
+        usdc(p.fee),
       );
 
     case "fee_claimed":
-      return `🧾 *Fees claimed* — ${usdc(p.amount)} to ${who(p.recipient)}`;
+      return NOTIFICATION_MD.feeClaimed(usdc(p.amount), who(p.recipient));
 
     case "withdrawal":
-      return `📤 *Withdrawal* — ${usdc(p.amount)} to ${who(p.to)}`;
+      return NOTIFICATION_MD.withdrawal(usdc(p.amount), who(p.to));
 
     case "withdrawal_pending":
-      return `⏳ *Withdrawal parked* — ${usdc(p.amount)} claimable by ${who(p.to)}`;
+      return NOTIFICATION_MD.withdrawalPending(usdc(p.amount), who(p.to));
 
     // ── mimir-squad ─────────────────────────────────────────────────────────
     case "market_created":
-      return (
-        `🆕 *New squad market* \\#${p.marketId}\n` +
-        `${escapeMd(clip(p.question))}\n` +
-        `Captain: ${who(p.captain)} · fee ${escapeMd(String(p.feeBps))} bps · ` +
-        `deadline ${escapeMd(new Date(p.deadline * 1000).toISOString())}`
+      return NOTIFICATION_MD.marketCreated(
+        String(p.marketId),
+        escapeMd(clip(p.question)),
+        who(p.captain),
+        escapeMd(String(p.feeBps)),
+        escapeMd(new Date(p.deadline * 1000).toISOString()),
       );
 
     case "deposited":
-      return (
-        `➕ *Squad \\#${p.marketId}* — ${usdc(p.amount)} on *${escapeMd(squadSideLabel(p.side))}*\n` +
-        `Participant: ${who(p.participant)}`
+      return NOTIFICATION_MD.deposited(
+        String(p.marketId),
+        usdc(p.amount),
+        escapeMd(squadSideLabel(p.side)),
+        who(p.participant),
       );
 
     case "withdrawn":
-      return (
-        `➖ *Squad \\#${p.marketId}* — ${who(p.participant)} pulled ${usdc(p.amount)} ` +
-        `from ${escapeMd(squadSideLabel(p.side))}`
+      return NOTIFICATION_MD.withdrawn(
+        String(p.marketId),
+        who(p.participant),
+        usdc(p.amount),
+        escapeMd(squadSideLabel(p.side)),
       );
 
     case "resolved":
-      return (
-        `🏁 *Squad \\#${p.marketId} resolved* — *${escapeMd(squadSideLabel(p.result))}*\n` +
-        `Pools: A ${usdc(p.poolA)} · B ${usdc(p.poolB)}`
+      return NOTIFICATION_MD.resolved(
+        String(p.marketId),
+        escapeMd(squadSideLabel(p.result)),
+        usdc(p.poolA),
+        usdc(p.poolB),
       );
 
     case "claimed":
-      return (
-        `💸 *Squad payout* on \\#${p.marketId}\n` +
-        `${who(p.participant)} → net *${usdc(p.net)}* \\(gross ${usdc(p.gross)}, fee ${usdc(p.fee)}\\)`
+      return NOTIFICATION_MD.claimed(
+        String(p.marketId),
+        who(p.participant),
+        usdc(p.net),
+        usdc(p.gross),
+        usdc(p.fee),
       );
 
     case "fees_claimed":
-      return `🧾 *Squad fees claimed* — ${usdc(p.amount)} to ${who(p.recipient)}`;
+      return NOTIFICATION_MD.feesClaimedSquad(usdc(p.amount), who(p.recipient));
 
     // Admin events and undecodable shapes get no notification. The poller logs
     // them so a silent bot is distinguishable from an unteachable one.
+    case "oracle_changed":
+    case "ownership_transferred":
+    case "agent_attributed":
+    case "fee_accrued":
+    case "fee_policy_set":
+    case "fee_policy_changed":
+    case "fee_policy_updated":
+    case "fee_policy_removed":
+    case "admin":
     case "unknown":
       return null;
 
@@ -212,12 +299,198 @@ export function formatEvent(
     if (head === null) return null;
     const body = `${head}\n${footer(config, event)}`;
     if (config.channelPreviewMode) {
-      return `🧪 *[PREVIEW MODE]*\n${body}`;
+      return `${NOTIFICATION_MD.previewModePrefix}\n${body}`;
     }
     return body;
   } catch (err) {
     return formatFallbackEvent(config, event, safeErrorMessage(err));
   }
+}
+
+/** Telegram's hard caption/message ceiling; the plain text stays well under it. */
+const MAX_PLAIN_TEXT_LENGTH = 4000;
+
+function plainUsdc(units: bigint): string {
+  return `${formatUsdc(units)} USDC`;
+}
+
+function plainWho(address: string): string {
+  return shortAddress(address);
+}
+
+function plainFooter(config: StellarConfig, event: DecodedEvent): string {
+  const url = eventExplorerUrl(config, event);
+  const ledger = `ledger ${event.ledger}`;
+  // Raw URL, not Markdown link syntax: with no parse_mode the brackets would
+  // render literally, while a bare URL stays readable and copyable.
+  return url ? `${ledger}\ntx: ${url}` : ledger;
+}
+
+/**
+ * The plain-text headline for an event, or null when there is nothing to say.
+ *
+ * Dedicated formatter, not a Markdown stripper: each case mirrors {@link headline}
+ * field-for-field (same identities, amounts, bounded clips) but emits no
+ * MarkdownV2 syntax at all, so Telegram cannot reject it for entity parsing.
+ */
+function plainHeadline(event: DecodedEvent): string | null {
+  const p = event.payload;
+
+  switch (p.name) {
+    // ── mimir-market ────────────────────────────────────────────────────────
+    case "claim_created":
+      return NOTIFICATION_PLAIN.claimCreated(p.claimId, clip(p.category), plainWho(p.creator));
+
+    case "claim_challenged":
+      return NOTIFICATION_PLAIN.claimChallenged(
+        p.claimId,
+        plainUsdc(p.stake),
+        plainWho(p.challenger),
+      );
+
+    case "claim_resolved":
+      return NOTIFICATION_PLAIN.claimResolved(
+        p.claimId,
+        winnerSideLabel(p.winnerSide),
+        String(p.confidence),
+        p.summary ? clip(p.summary) : null,
+      );
+
+    case "claim_cancelled":
+      return NOTIFICATION_PLAIN.claimCancelled(p.claimId);
+
+    case "market_settled":
+      return NOTIFICATION_PLAIN.marketSettled(
+        p.claimId,
+        plainUsdc(p.totalPaid),
+        plainUsdc(p.totalFees),
+        plainUsdc(p.owedToChallengers),
+      );
+
+    case "challenger_paid":
+      return NOTIFICATION_PLAIN.challengerPaid(
+        p.claimId,
+        plainWho(p.challenger),
+        plainUsdc(p.stake),
+        plainUsdc(p.net),
+        plainUsdc(p.gross),
+        plainUsdc(p.fee),
+      );
+
+    case "fee_claimed":
+      return NOTIFICATION_PLAIN.feeClaimed(plainUsdc(p.amount), plainWho(p.recipient));
+
+    case "withdrawal":
+      return NOTIFICATION_PLAIN.withdrawal(plainUsdc(p.amount), plainWho(p.to));
+
+    case "withdrawal_pending":
+      return NOTIFICATION_PLAIN.withdrawalPending(plainUsdc(p.amount), plainWho(p.to));
+
+    // ── mimir-squad ─────────────────────────────────────────────────────────
+    case "market_created":
+      return NOTIFICATION_PLAIN.marketCreated(
+        p.marketId,
+        clip(p.question),
+        plainWho(p.captain),
+        String(p.feeBps),
+        new Date(p.deadline * 1000).toISOString(),
+      );
+
+    case "deposited":
+      return NOTIFICATION_PLAIN.deposited(
+        p.marketId,
+        plainUsdc(p.amount),
+        squadSideLabel(p.side),
+        plainWho(p.participant),
+      );
+
+    case "withdrawn":
+      return NOTIFICATION_PLAIN.withdrawn(
+        p.marketId,
+        plainWho(p.participant),
+        plainUsdc(p.amount),
+        squadSideLabel(p.side),
+      );
+
+    case "resolved":
+      return NOTIFICATION_PLAIN.resolved(
+        p.marketId,
+        squadSideLabel(p.result),
+        plainUsdc(p.poolA),
+        plainUsdc(p.poolB),
+      );
+
+    case "claimed":
+      return NOTIFICATION_PLAIN.claimed(
+        p.marketId,
+        plainWho(p.participant),
+        plainUsdc(p.net),
+        plainUsdc(p.gross),
+        plainUsdc(p.fee),
+      );
+
+    case "fees_claimed":
+      return NOTIFICATION_PLAIN.feesClaimedSquad(plainUsdc(p.amount), plainWho(p.recipient));
+
+    // Same set as `headline`: admin events and undecodable shapes get nothing.
+    case "oracle_changed":
+    case "ownership_transferred":
+    case "agent_attributed":
+    case "fee_accrued":
+    case "fee_policy_set":
+    case "fee_policy_changed":
+    case "fee_policy_updated":
+    case "fee_policy_removed":
+    case "admin":
+    case "unknown":
+      return null;
+
+    default:
+      return null;
+  }
+}
+
+/**
+ * Clip a finished plain-text message without splitting a Unicode code point.
+ */
+function clipPlainText(text: string, max = MAX_PLAIN_TEXT_LENGTH): string {
+  const characters = Array.from(text);
+  return characters.length <= max ? text : `${characters.slice(0, max - 1).join("")}…`;
+}
+
+/**
+ * The plain-text notification for an event, or null when it is not notifiable.
+ *
+ * Same information as {@link formatEvent} (identity, amounts, ledger, explorer
+ * URL when valid) with no Markdown of any kind. Sent without a `parse_mode`,
+ * so Telegram delivers it even when the MarkdownV2 rendering is rejected.
+ * Never throws and never returns an empty string: malformed input degrades to
+ * a minimal bounded line rather than crashing the notifier.
+ */
+export function formatPlainTextEvent(
+  config: StellarConfig,
+  event: DecodedEvent,
+): string | null {
+  try {
+    const head = plainHeadline(event);
+    if (head === null) return null;
+    const body = `${head}\n${plainFooter(config, event)}`.trim();
+    if (!body) return minimalPlainTextEvent(event);
+    return clipPlainText(body);
+  } catch {
+    return minimalPlainTextEvent(event);
+  }
+}
+
+/** Last-resort bounded line when even the plain-text formatter cannot render. */
+function minimalPlainTextEvent(event: DecodedEvent): string {
+  const source = typeof event?.source === "string" ? event.source : "unknown";
+  const ledger =
+    typeof event?.ledger === "number" && Number.isFinite(event.ledger)
+      ? `ledger ${event.ledger}`
+      : "ledger unknown";
+  const eventId = typeof event?.eventId === "string" && event.eventId ? event.eventId : "";
+  return clipPlainText(NOTIFICATION_PLAIN.minimal(source, ledger, eventId));
 }
 
 /**
@@ -233,11 +506,7 @@ export function formatFallbackEvent(
   const ledger = escapeMd(String(event.ledger ?? "unknown"));
   const safeReason = escapeMd(safeErrorMessage(reason));
   const txPart = event.txHash ? ` · [tx](${txExplorerUrl(config, event.txHash)})` : "";
-  return (
-    `⚠️ *Event Notification Fallback* \\(${source}\\)\n` +
-    `Contract: \`${contract}\` · Ledger: ${ledger}${txPart}\n` +
-    `Reason: _${safeReason}_`
-  );
+  return NOTIFICATION_MD.fallbackEvent(source, contract, ledger, safeReason, txPart);
 }
 
 /**
@@ -251,9 +520,13 @@ export function previewMessage(config: StellarConfig, target = "market"): string
       source: "squad",
       contractId: config.squadContractId,
       ledger: 1000000,
-      txHash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
       at: Math.floor(Date.now() / 1000),
       eventId: "1000000-1",
+      eventType: "contract",
+      transactionIndex: 0,
+      operationIndex: 0,
+      inSuccessfulContractCall: true,
       payload: {
         name: "market_created",
         marketId: 1,
@@ -264,16 +537,20 @@ export function previewMessage(config: StellarConfig, target = "market"): string
       },
     };
     const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
-    return `🧪 *Channel Preview — mimir\\-squad*\n\n${formatted}`;
+    return `${NOTIFICATION_MD.channelPreviewSquad}\n\n${formatted}`;
   }
 
   const sampleEvent: DecodedEvent = {
     source: "market",
     contractId: config.marketContractId,
     ledger: 1000000,
-    txHash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
     at: Math.floor(Date.now() / 1000),
     eventId: "1000000-0",
+    eventType: "contract",
+    transactionIndex: 0,
+    operationIndex: 0,
+    inSuccessfulContractCall: true,
     payload: {
       name: "claim_created",
       claimId: 1,
@@ -282,6 +559,6 @@ export function previewMessage(config: StellarConfig, target = "market"): string
     },
   };
   const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
-  return `🧪 *Channel Preview — mimir\\-market*\n\n${formatted}`;
+  return `${NOTIFICATION_MD.channelPreviewMarket}\n\n${formatted}`;
 }
 

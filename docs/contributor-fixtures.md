@@ -37,15 +37,18 @@ Do not wire `npm run scan` into automated tests.
 | `tests/fixtures/cursor-corrupt.txt` | Unreadable cursor sample (cold-start path) |
 | `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
 | `tests/format.test.mjs` | Inline event-formatting units (MarkdownV2, USDC, Telegram send failures) |
-| `tests/poller.test.mjs` | Restart-gap detection and cursor-window boundary cases against a fake RPC |
+| `tests/dedup.test.mjs` | Inline unit cases for the bounded dedup window (`src/dedup.ts`) |
+| `tests/page-dedup.test.mjs` | Fake-RPC overlapping-page walk + fake-Telegram poller/restart cases |
 | `tests/bot.test.mjs` | Mocked grammy operator-command routing and exact reply payloads |
-| `tests/poller.test.mjs` | Cursor load/advance, RPC and Telegram failure, send cap, stop semantics |
+| `tests/poller.test.mjs` | Cursor load/advance, RPC and Telegram failure, send cap, stop semantics, graceful-shutdown flush, drain deadline, shutdown notification drop |
 | `tests/poller-controls.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
 | `tests/cursor-restart.test.mjs` | Stale cursors, unwritable data dir, restart round-trip |
+| `tests/ledger-window.test.mjs` | Ledger-window bounds: clamping, out-of-window cursors, malformed-XDR scanner safety, restart |
 | `tests/helpers/temp-data.mjs` | Ephemeral data directory helper shared by persistence tests |
 | `tests/soak.test.mjs` | Long-run memory/timer/log boundedness under scripted RPC and Telegram failures (mock timers, forced GC, leak control) |
 | `tests/mock-rpc.test.mjs` | Live mock RPC: scanner walks, poller failure drills, cursor safety, log bounds |
 | `tests/mock-profile.test.mjs` | `MIMIR_PROFILE=mock` defaults, explicit-env precedence, unknown-profile failure |
+| `tests/config.test.mjs` | Env loading and validation, including the `SHUTDOWN_TIMEOUT_MS` drain budget |
 
 ## Event fixture schema
 
@@ -93,7 +96,7 @@ Rules:
 | `positive` | Happy-path notification for a known market/squad event | `notify` |
 | `negative` | Malformed / unknown / admin-shaped payload → no chat message | `skip` |
 | `boundary` | Clipping, reserved MarkdownV2 chars, zero/max amounts | `notify` or `skip` |
-| `restart` | Documents cursor resume, restart-gap reset, and corrupt-file cold start (see cursor fixtures) | n/a in format suite |
+| `restart` | Documents cursor resume, restart-gap detection and corrupt-file cold start (see cursor fixtures) | n/a in format suite |
 
 `expect: "notify"` requires a non-null MarkdownV2 string from `formatEvent`.
 `expect: "skip"` requires `null` (or an `unknown` payload that the poller would
@@ -103,12 +106,14 @@ log and not post).
 
 - **Valid cursor** (`cursor-valid.json`): version `1`, per-target opaque
   `cursor` string + `lastEventLedger`. Matches what the poller write-then-renames
-  under `CURSOR_FILE` (default `./data/cursor.json`).
-- **Stale cursor** (`cursor-stale.json`): same shape, but the cursor's ledger
-  (`4250000`, i.e. `TOID >> 32`) sits below a sample retained floor of `4300000`.
-  The poller must classify it as a **restart gap**, log it once, and reset that
-  target to a cold start — never retry it forever behind a floor that has
-  already moved past it.
+  under `CURSOR_FILE` (default `./data/cursor.json`). New files also carry an
+  additive, bounded `recentEventIds` dedup window; a file without it is still
+  valid and loads with an empty window.
+- **Stale cursor** (`cursor-stale.json`): same shape as a valid cursor, but the
+  cursor's ledger (`4250000`, i.e. `TOID >> 32`) sits below a sample retained floor
+  of `4300000`. The poller must classify it as a **restart gap**, record what was
+  lost, and recover by rewinding to the floor — never retry it forever behind a
+  floor that has already moved past it.
 - **Corrupt cursor** (`cursor-corrupt.txt`): not JSON. The poller must treat this
   as a **cold start**, not a crash — leave the in-memory cursor null and begin
   `START_LOOKBACK_LEDGERS` behind tip.
@@ -139,13 +144,19 @@ test("resumes", () =>
 | Failure | Cursor | Notification | Fixture tip |
 | --- | --- | --- | --- |
 | RPC error for one contract | **unchanged** for that target | none that cycle | Fake rejected `readContractEvents`; assert cursor string identical |
+| Ledger-window violation (start ledger or cursor **above** the tip) | **unchanged** | none that cycle | Fake `getHealth` window plus an out-of-window value; assert a bounded `LedgerWindowError` and that no `getEvents` request is sent |
+| Cursor **below** the retained floor (stale) | **unchanged** | none that cycle | Fake `getHealth` window plus a stale cursor; assert the cursor is forwarded and the RPC's bounded stale rejection is surfaced |
+| Cursor below the floor, RPC answers with an **empty page** (no error) | **rewound** to the floor | retained window delivered late | Fake `getHealth` window plus a cursor walk that hands back the same cursor; assert one restart gap is recorded and the walk resumes at the floor |
+| Cursor string with no readable ledger | **unchanged**, flagged `cursorUnreadable` | none that cycle | Pass a non-TOID cursor; assert no gap is recorded and the token is forwarded |
 | Telegram send error | **commits after partial delivery** | counted as failed | Fake `sendMessage` reject; assert cursor advances and no token appears in the Error message |
 | Corrupt cursor file | cold start | n/a | Use `cursor-corrupt.txt` contents |
-| Cursor below the retained floor | **reset to cold start** | n/a | Use `cursor-stale.json`; assert `classifyCursorWindow` says `stale` |
-| Cursor string with no readable ledger | **unchanged**, flagged `cursorUnreadable` | n/a | Pass a non-TOID cursor; assert no gap is recorded |
 | Burst over cap | advances | extras skipped | Cap `MAX_NOTIFICATIONS_PER_CYCLE` in the fake config |
+| Graceful shutdown mid-cycle | **flushed** if the cycle advanced it, untouched otherwise | the in-flight send finishes; the rest are dropped and counted | Fake a second target that blocks after the first advanced; assert the file the restarted poller loads |
+| Shutdown deadline expires | whatever was already on disk — never clobbered | the abandoned cycle may lose its remaining sends | Fake a server that never resolves; assert the file is byte-identical and no `.tmp` is left behind |
 | Unauthorized `/pause` or `/resume` | untouched | no command reply | Mock grammy with a different Telegram user id |
 | Operator pause → restart | version-1 cursor unchanged | no replay | Reload a valid cursor fixture; pause must not persist |
+| Overlapping page / resumed cursor | advances | duplicate suppressed, counted | Fake RPC returns the same event id twice; assert one send |
+| Restart with a saved window | resumed | boundary event suppressed | Point two pollers at one temp `CURSOR_FILE` |
 
 ## Failure drills against the local mock
 

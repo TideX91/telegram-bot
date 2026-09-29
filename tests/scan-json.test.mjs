@@ -52,14 +52,16 @@ test("eventHistogram counts known and unknown names", () => {
   const hist = eventHistogram([
     sampleEvent(),
     sampleEvent({
-      payload: { name: "unknown", eventName: "oracle_changed", reason: "skipped" },
+      payload: { name: "unknown", eventName: "some_unrecognized_event", reason: "skipped" },
     }),
     sampleEvent({ payload: { name: "claim_created", claimId: 1, creator: "G", category: "crypto" } }),
+    sampleEvent({ payload: { name: "oracle_changed", newOracle: "GABCD", details: {} } }),
     sampleEvent(),
   ]);
   assert.equal(hist.claim_challenged, 2);
   assert.equal(hist.claim_created, 1);
-  assert.equal(hist["unknown:oracle_changed"], 1);
+  assert.equal(hist.oracle_changed, 1);
+  assert.equal(hist["unknown:some_unrecognized_event"], 1);
 });
 
 test("buildScanJsonTarget respects --show limit and serializes safely", () => {
