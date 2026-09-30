@@ -103,7 +103,7 @@ test("the mock profile fills unset values with loopback and isolated-cursor defa
     // Placeholder, not credential-shaped, and never delivered anywhere.
     assert.equal(config.botToken, "MOCK-PROFILE-NOT-A-BOT-TOKEN");
     assert.doesNotMatch(config.botToken, /^\d{6,12}:/);
-    assert.equal(config.chatId, "@mock_profile");
+    assert.equal(config.chatIds[0], "@mock_profile");
     assert.equal(config.operatorTelegramUserId, null);
   });
 });

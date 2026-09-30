@@ -1,0 +1,85 @@
+name: Feature request
+description: Propose a change to the Mimir notifier's command, poller, scanner, tooling, or documentation.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing a change. Every feature must preserve two rules:
+        * The **chain is the source of truth** — the bot stays **read-only**: no signing keys,
+          no transaction submission.
+        * Every behavior it introduces must be **bounded and documented** for the failure modes
+          this bot lives with: malformed events, stale cursors, RPC failures, Telegram failures,
+          restarts, and rate limits.
+
+        Architecture and operational details live in
+        [docs/component-architecture.md](docs/component-architecture.md) and
+        [docs/incident-runbook.md](docs/incident-runbook.md); the
+        [contributor fixture guide](docs/contributor-fixtures.md) shows how tests stay
+        credential-free.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: The operator, deploy, or reliability gap this addresses.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: >
+        What to add or change, and through which existing surface it is reached — a bot command,
+        the poller, the scanner/replay/audit tooling, a config variable, a fixture, or the docs.
+        Keep it read-only with respect to the chain, unless you explicitly justify otherwise.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      description: Where does this live?
+      multiple: true
+      options:
+        - Bot command / notification formatting
+        - Poller (cursor, dedup, circuit breaker, chain clock, shutdown)
+        - Scanner / replay / seed-cursor / audit tooling
+        - Config variables or profiles
+        - Integration fakes / mock RPC / unit tests
+        - Documentation (README, docs/)
+        - Performance / boundedness
+    validations:
+      required: true
+  - type: textarea
+    id: failure-modes
+    attributes:
+      label: Failure-mode behavior
+      description: >
+        Define the bounded behavior for each affected phase — malformed events, stale cursors,
+        RPC failures, Telegram failures / rate limits, restarts, and the per-cycle notification
+        cap. What must stay true for the cursor and for what ends up in the channel?
+  - type: textarea
+    id: config-cursor
+    attributes:
+      label: Config and cursor compatibility
+      description: >
+        New environment variables, profile defaults, and any change to the version-1 cursor file
+        shape (including the `recentEventIds` dedup window and `rewindFromLedger`). Older cursor
+        files must keep loading; document the migration.
+  - type: textarea
+    id: logging
+    attributes:
+      label: Logs and status
+      description: >
+        What operators will see. Nothing here may include bot tokens, private keys, payment
+        proofs, or unbounded remote payloads — scrubbing is centralized in `src/redact.ts`.
+  - type: textarea
+    id: tests
+    attributes:
+      label: Test expectations
+      description: >
+        Focused positive, negative, boundary, restart, and regression coverage under `tests/`,
+        runnable with `npm run typecheck && npm run build && npm test` — no live Testnet and no
+        Telegram credentials. Add fixtures under `tests/fixtures/` and update the fixture guide
+        when behavior affecting ops changes.

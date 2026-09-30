@@ -24,7 +24,7 @@ function baseConfig(cursorFile) {
     networkPassphrase: "Test SDF Network ; September 2015",
     explorerBaseUrl: "https://example.invalid/explorer",
     botToken: "123456789:TEST-ONLY-TOKEN-NEVER-USE",
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     operatorTelegramUserId: "42",
     pollIntervalMs: 5_000,
     startLookbackLedgers: 60,
@@ -185,6 +185,26 @@ test("RPC failures are bounded and redact the configured bot token in status", a
     console.error = originalError;
     poller.stop();
     await waitForCursorRewrite(cursorFile, originalUpdatedAt);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("poller refuses to start if the persistent volume is unwritable", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-volume-failure-"));
+  const cursorFile = path.join(directory, "not-exist/cursor.json");
+  // Prevent directory creation by creating a file where the directory should be
+  await writeFile(path.join(directory, "not-exist"), "blocked", "utf8");
+
+  const poller = createPoller({
+    config: baseConfig(cursorFile),
+    server: stuckServer(),
+    send: async () => undefined,
+  });
+
+  try {
+    await assert.rejects(poller.start(), /Persistent volume is not writable/);
+  } finally {
+    poller.stop();
     await rm(directory, { recursive: true, force: true });
   }
 });

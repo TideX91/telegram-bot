@@ -10,6 +10,7 @@
  * phone lock screen.
  */
 
+import { redactText } from "../redact.js";
 import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
@@ -64,23 +65,61 @@ function describeError(error: unknown): string {
 }
 
 /**
+ * Telegram send timeout budget, in milliseconds.
+ *
+ * Individual sends are bounded so a single stalled request cannot wedge the
+ * poller: the cursor must advance (or the batch must be retried) on a
+ * predictable schedule, not on Telegram's liveness. Kept here, next to the
+ * error formatting, so the poller and its tests share one source of truth.
+ */
+export const TELEGRAM_SEND_TIMEOUT_MS = 10_000;
+
+/**
+ * True when a thrown value looks like a timeout/abort rather than a Telegram
+ * API rejection. Recognises `AbortError`, `TimeoutError`, and the common
+ * `ETIMEDOUT`/`ECONNRESET`/`UND_ERR_*` shapes surfaced by fetch/undici, so the
+ * poller can log "timed out" instead of a generic failure and retry the batch.
+ */
+export function isTimeoutError(error: unknown): boolean {
+  if (error instanceof Error) {
+    if (error.name === "AbortError" || error.name === "TimeoutError") return true;
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(code)) {
+      return true;
+    }
+    return /timed? ?out/i.test(error.message);
+  }
+  if (error !== null && typeof error === "object") {
+    const record = error as { name?: unknown; code?: unknown; message?: unknown };
+    if (record.name === "AbortError" || record.name === "TimeoutError") return true;
+    if (typeof record.code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(record.code)) {
+      return true;
+    }
+    if (typeof record.message === "string" && /timed? ?out/i.test(record.message)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Keep operational errors actionable without copying remote payloads or the
  * bot token into logs and status messages.
  */
 export function safeErrorMessage(error: unknown, secrets: readonly string[] = []): string {
-  let message = describeError(error);
-  for (const secret of secrets) {
-    if (secret) message = message.split(secret).join("[REDACTED]");
-  }
+  // Collapse first, so the bound below is applied to the text that will
+  // actually be shown rather than to remote whitespace.
+  const collapsed = describeError(error).replace(/\s+/g, " ").trim();
 
-  // Also cover a Telegram token embedded in an upstream error when the
-  // caller does not have the configured value (for example in a unit test).
-  message = message.replace(
-    /(?<![A-Za-z0-9_-])\d{6,12}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g,
-    "[REDACTED]",
-  );
+  // Caller-supplied secrets, the secrets registered at boot, and the
+  // credential shapes in `redact.ts`: the same rules the audit trail
+  // applies, so an error cannot carry a seed strkey, a token, or a URL's
+  // credentials into a log, `/status`, or `/health`.
+  const message = redactText(collapsed, { secrets });
 
-  const compact = message.replace(/\s+/g, " ").trim() || "unknown error";
+  // A timeout is labelled explicitly so operators can tell a stalled Telegram
+  // send from an API rejection without parsing the raw error text.
+  const compact = message.trim() || (isTimeoutError(error) ? "send timed out" : "unknown error");
   return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
 }
 
@@ -92,6 +131,14 @@ function who(address: string): string {
   return `\`${escapeMd(shortAddress(address))}\``;
 }
 
+/**
+ * Truncate an unbounded contract String before it sizes a chat message.
+ *
+ * The category, question, and summary fields all come from remote contract
+ * state. A hard cap here means a crafted payload cannot push an unbounded
+ * string through to a Telegram message or to a log line.
+ */
+export function clip(text: string, max = 200): string {
 /** Truncate an unbounded contract String without splitting a Unicode code point. */
 function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
   const trimmed = text.trim();
@@ -157,6 +204,30 @@ export function explorerKeyboard(
   const url = eventExplorerUrl(config, event);
   if (!url) return undefined;
   return { inline_keyboard: [[{ text: EXPLORER_BUTTON_TEXT, url }]] };
+}
+
+/** Format the latest observed event, including events with no notification template. */
+export function formatLastEvent(config: StellarConfig, event: DecodedEvent): string {
+  const notification = formatEvent(config, event);
+  if (notification !== null) return notification;
+
+  const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
+  return (
+    `*Last observed event* — \`${escapeMd(clip(name, 120))}\`\n` +
+    `This event has no notification summary\.\n${footer(config, event)}`
+  );
+}
+
+/** Format the latest observed event, including events with no notification template. */
+export function formatLastEvent(config: StellarConfig, event: DecodedEvent): string {
+  const notification = formatEvent(config, event);
+  if (notification !== null) return notification;
+
+  const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
+  return (
+    `*Last observed event* — \`${escapeMd(clip(name, 120))}\`\n` +
+    `This event has no notification summary\.\n${footer(config, event)}`
+  );
 }
 
 /**

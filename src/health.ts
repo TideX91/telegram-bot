@@ -12,7 +12,9 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
+import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
+import { redactText } from "./redact.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -50,6 +52,8 @@ export interface HealthReport {
     stopping: boolean;
     channelPreviewMode: boolean;
     cycles: number;
+    /** Correlation ID for the most recently started poll cycle. */
+    lastCorrelationId: string | null;
     lastPollAt: string | null;
     lastSuccessAt: string | null;
     latestLedger: number | null;
@@ -72,6 +76,8 @@ export interface HealthReport {
     /** Cursors automatically rewound to the RPC's retained floor this run. */
     cursorRewinds: number;
     consecutiveFailures: number;
+    /** Repetitive error lines summarized rather than printed since start. */
+    suppressedLogs: number;
     lastError: { at: string; message: string } | null;
     /** Restart gaps detected since this process started. */
     restartGaps: number;
@@ -95,6 +101,7 @@ export interface HealthReport {
     lastFlushAt: string | null;
     targets: Array<{
       source: string;
+      version: string;
       /** Public contract id (on-chain). */
       contractId: string;
       lastEventLedger: number | null;
@@ -110,8 +117,14 @@ export interface HealthReport {
       rewindFromLedger: number | null;
       /** RPC rejected this target's cursor as stale; true until a scan succeeds. */
       cursorStale: boolean;
+      /** Successful cycles with an unchanged cursor while behind the tip. */
+      cyclesWithoutAdvance: number;
+      /** Cursor unchanged for {@link CURSOR_STALL_CYCLES} cycles while behind tip. */
+      cursorStalled: boolean;
       hasError: boolean;
     }>;
+    persistentVolumeAvailable: boolean;
+    persistentVolumeError: string | null;
   };
   /**
    * Where configuration came from: each setting's name and the source that
@@ -204,12 +217,15 @@ export function buildHealthReport(
     const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(config.pollIntervalMs, 1)));
     const tooManyFailures = poller.consecutiveFailures >= failureBudget;
     const hasStaleCursor = poller.targets.some((target) => target.cursorStale === true);
+    // A stalled cursor is a live fault the failure counters cannot see: every
+    // cycle succeeds, it just never makes progress.
+    const hasStalledCursor = poller.targets.some((target) => target.cursorStalled === true);
     const hasEverSucceeded = poller.lastSuccessAt !== null;
     const stale =
       hasEverSucceeded &&
       config.healthStaleMs > 0 &&
       nowMs - (poller.lastSuccessAt as number) > config.healthStaleMs;
-    status = tooManyFailures || stale || hasStaleCursor ? "degraded" : "ok";
+    status = tooManyFailures || stale || hasStaleCursor || hasStalledCursor ? "degraded" : "ok";
   }
 
   return {
@@ -225,6 +241,7 @@ export function buildHealthReport(
       stopping: poller.stopping === true,
       channelPreviewMode: config.channelPreviewMode === true,
       cycles: poller.cycles,
+      lastCorrelationId: poller.lastCorrelationId ?? null,
       lastPollAt: iso(poller.lastPollAt),
       lastSuccessAt: iso(poller.lastSuccessAt),
       latestLedger: poller.latestLedger,
@@ -238,8 +255,12 @@ export function buildHealthReport(
       notificationsDropped: poller.notificationsDropped ?? 0,
       cursorRewinds: poller.cursorRewinds ?? 0,
       consecutiveFailures: poller.consecutiveFailures,
+      suppressedLogs: poller.suppressedLogs ?? 0,
       lastError: poller.lastError
-        ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }
+        ? {
+            at: new Date(poller.lastError.at).toISOString(),
+            message: redactText(poller.lastError.message),
+          }
         : null,
       restartGaps: poller.restartGaps ?? 0,
       lastRestartGap: poller.lastRestartGap
@@ -255,19 +276,88 @@ export function buildHealthReport(
       lastFlushAt: iso(poller.lastFlushAt ?? null),
       targets: poller.targets.map((t) => ({
         source: t.source,
+        version: t.version ?? "v1",
         contractId: t.contractId,
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),
         rewindFromLedger: typeof t.rewindFromLedger === "number" ? t.rewindFromLedger : null,
         cursorStale: t.cursorStale === true,
-        gapLedgers: t.gapLedgers ?? 0,
-        cursorResetAt: iso(t.cursorResetAt ?? null),
-        cursorUnreadable: t.cursorUnreadable ?? false,
+        cursorStalled: t.cursorStalled === true,
+        cyclesWithoutAdvance: t.cyclesWithoutAdvance,
         hasError: t.lastError !== null,
       })),
+      persistentVolumeAvailable: poller.persistentVolumeAvailable ?? true,
+      persistentVolumeError: poller.persistentVolumeError ?? null,
     },
     config: provenance,
   };
+}
+
+/**
+ * Render poller status as Prometheus metrics.
+ */
+export function buildMetricsReport(
+  config: BotConfig,
+  poller: PollerStatus,
+  nowMs: number = Date.now(),
+): string {
+  const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
+  const network = networkLabel(config);
+
+  const lines: string[] = [
+    `# HELP mimir_telegram_uptime_ms Uptime in milliseconds`,
+    `# TYPE mimir_telegram_uptime_ms gauge`,
+    `mimir_telegram_uptime_ms{network="${network}"} ${uptimeMs}`,
+    ``,
+    `# HELP mimir_telegram_poller_running Whether the poller is currently running (1) or stopped/paused (0)`,
+    `# TYPE mimir_telegram_poller_running gauge`,
+    `mimir_telegram_poller_running{network="${network}"} ${poller.running && !poller.paused ? 1 : 0}`,
+    ``,
+    `# HELP mimir_telegram_poller_cycles_total Total number of completed poll cycles`,
+    `# TYPE mimir_telegram_poller_cycles_total counter`,
+    `mimir_telegram_poller_cycles_total{network="${network}"} ${poller.cycles}`,
+    ``,
+    `# HELP mimir_telegram_notifications_sent_total Total number of Telegram messages successfully sent`,
+    `# TYPE mimir_telegram_notifications_sent_total counter`,
+    `mimir_telegram_notifications_sent_total{network="${network}"} ${poller.notificationsSent}`,
+    ``,
+    `# HELP mimir_telegram_notifications_failed_total Total number of Telegram messages that failed to send after retries`,
+    `# TYPE mimir_telegram_notifications_failed_total counter`,
+    `mimir_telegram_notifications_failed_total{network="${network}"} ${poller.notificationsFailed}`,
+    ``,
+    `# HELP mimir_telegram_events_skipped_total Total number of events skipped (unrecognized, unformatted, or rate-limited)`,
+    `# TYPE mimir_telegram_events_skipped_total counter`,
+    `mimir_telegram_events_skipped_total{network="${network}"} ${poller.eventsSkipped}`,
+    ``,
+    `# HELP mimir_telegram_consecutive_failures Current number of consecutive failed poll cycles`,
+    `# TYPE mimir_telegram_consecutive_failures gauge`,
+    `mimir_telegram_consecutive_failures{network="${network}"} ${poller.consecutiveFailures}`,
+  ];
+
+  if (poller.latestLedger !== null) {
+    lines.push(
+      ``,
+      `# HELP mimir_telegram_latest_ledger Highest ledger seen by the poller`,
+      `# TYPE mimir_telegram_latest_ledger gauge`,
+      `mimir_telegram_latest_ledger{network="${network}"} ${poller.latestLedger}`
+    );
+  }
+
+  const targetsWithLedgers = poller.targets.filter((t) => t.lastEventLedger !== null);
+  if (targetsWithLedgers.length > 0) {
+    lines.push(
+      ``,
+      `# HELP mimir_telegram_target_last_event_ledger Highest ledger in which an event was processed for a target`,
+      `# TYPE mimir_telegram_target_last_event_ledger gauge`,
+    );
+    for (const target of targetsWithLedgers) {
+      lines.push(
+        `mimir_telegram_target_last_event_ledger{network="${network}",source="${target.source}",contract="${target.contractId}"} ${target.lastEventLedger}`
+      );
+    }
+  }
+
+  return lines.join("\\n") + "\\n";
 }
 
 function sendJson(
@@ -304,6 +394,11 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
+    if (deps.webhookHandler && method === "POST" && url.pathname === "/telegram-webhook") {
+      deps.webhookHandler(req, res);
+      return;
+    }
+
     if (method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
       const report = buildHealthReport(config, status(), now(), provenance());
       sendJson(res, report.ok ? 200 : 503, report);
@@ -322,11 +417,23 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/metrics") {
+      const metrics = buildMetricsReport(config, status(), now());
+      res.writeHead(200, {
+        "content-type": "text/plain; version=0.0.4; charset=utf-8",
+        "cache-control": "no-store",
+        "content-length": Buffer.byteLength(metrics),
+      });
+      res.end(metrics);
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/") {
       sendJson(res, 200, {
         service: "mimir-telegram-bot",
         health: "/health",
         live: "/health/live",
+        metrics: "/metrics",
       });
       return;
     }
@@ -336,7 +443,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
 
   // Failures after listen (e.g. client aborts) must not take down the notifier.
   server.on("error", (err) => {
-    console.error(`[health] server error: ${err instanceof Error ? err.message : err}`);
+    console.error(`[health] server error: ${safeErrorMessage(err)}`);
   });
 
   server.listen(config.healthPort, config.healthHost);

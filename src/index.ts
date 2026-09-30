@@ -26,7 +26,10 @@ import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
+import { createMetrics } from "./metrics.js";
+import type { MetricsServer } from "./metrics.js";
 import { boundText } from "./status.js";
+import { redactUrl, registerSecrets } from "./redact.js";
 
 /**
  * Installed before anything else can throw, so a rejection during startup is
@@ -94,6 +97,11 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
 
+  // Register this process's secrets before anything can fail: every
+  // operator-facing error goes through the scrubber, so a call site cannot
+  // leak the token or the chat id by forgetting to pass them.
+  registerSecrets([config.botToken, config.chatId]);
+
   // The mock profile exists for the dry-run entry, not this one: warn loudly
   // so a profile left set in a deployment is noticed before Telegram rejects
   // the placeholder token.
@@ -106,9 +114,17 @@ async function main(): Promise<void> {
   }
 
   console.log(`[boot] Mimir Telegram notifier`);
-  console.log(`[boot] network      ${networkLabel(config)} (${config.rpcUrl})`);
+  console.log(`[boot] network      ${networkLabel(config)} (${redactUrl(config.rpcUrl)})`);
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
+  console.log(`[boot] chat         ${config.chatId}`);
+  console.log(
+    `[boot] allowlist    ${
+      config.allowedChatIds.length === 0
+        ? "open (ALLOWED_CHAT_IDS unset)"
+        : `${config.allowedChatIds.length} chat(s)`
+    }`,
+  );
   console.log(`[boot] cursor file  ${config.cursorFile}`);
   console.log(`[boot] flags        ${formatFeatureFlags(config.featureFlags)}`);
   console.log(`[boot] audit file   ${config.auditFile}`);
@@ -128,6 +144,26 @@ async function main(): Promise<void> {
   console.log(`[boot] config       ${formatProvenanceSummary(provenance)}`);
   for (const warning of provenance.warnings) {
     console.warn(`[boot] config       ${warning}`);
+  }
+
+  // ── Metrics ────────────────────────────────────────────────────────────────
+  // Create the registry unconditionally; the HTTP server is only started when
+  // METRICS_PORT is configured. This means the poller always has a metrics
+  // object to call — no null checks needed there.
+  const metrics = createMetrics();
+
+  let metricsServer: MetricsServer | null = null;
+  if (config.metricsPort !== null) {
+    try {
+      metricsServer = await metrics.startServer(config.metricsPort);
+    } catch (err) {
+      // Metrics are optional. A port conflict or privilege error must not
+      // prevent the bot from starting — just log and continue.
+      console.error(
+        `[boot] metrics server failed to start on port ${config.metricsPort}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   const server = createRpcServer(config);
@@ -151,6 +187,8 @@ async function main(): Promise<void> {
     throw new Error("telegram notifier not ready");
   };
 
+  const poller = createPoller({ config, server, send: (text) => notify(text), metrics });
+  const bot = createBot({ config, status: () => poller.status() });
   const audit = createAuditLog();
   audit.record(
     auditEntry("boot", {
@@ -170,11 +208,15 @@ async function main(): Promise<void> {
     pause: () => poller.pause(),
     resume: () => poller.resume(),
   });
-  notify = createNotifier(bot, config);
+  notify = createNotifier(bot);
 
   // Local-only health HTTP for supervisors. Starts before Telegram long-poll
   // so a deploy probe can see the process even while grammy is connecting.
-  const healthServer = startHealthServer({ config, status: () => poller.status() });
+  const healthServer = startHealthServer({
+    config,
+    status: () => poller.status(),
+    webhookHandler: config.telegramWebhookUrl ? webhookCallback(bot, "http") : undefined,
+  });
 
   await registerCommands(bot, config);
 
@@ -209,6 +251,11 @@ async function main(): Promise<void> {
    * cold-ish resume bounded by the last completed cycle.
    */
   const shutdown = (signal: string) => {
+    console.log(`[shutdown] ${signal} received, stopping`);
+    poller.stop();
+    const stopBot = bot.stop().finally(() => process.exit(0));
+    const stopMetrics = metricsServer ? metricsServer.close() : Promise.resolve();
+    void Promise.all([stopBot, stopMetrics]);
     if (shuttingDown) {
       console.warn(`[shutdown] ${signal} received again during drain; forcing exit`);
       process.exit(signal === "SIGINT" ? 130 : 143);

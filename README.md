@@ -34,7 +34,24 @@ it holds no keys and signs nothing.
 
 Admin events (`oracle_changed`, `ownership_transferred`, `fee_policy_*`,
 `fee_accrued`, `agent_attributed`) are decoded far enough to be recognised and
-then skipped — they are logged, not posted.
+then skipped — they are retained as bounded `unknown` events and logged with
+their event name, ledger, and bounded decode reason, not posted. New event names
+and malformed XDR follow the same path, so they cannot stop polling or advance a
+log with an unbounded remote payload.
+
+## Claim category filtering
+
+The notifier can be restricted to a subset of claim categories by setting an
+optional allowlist in `.env`:
+
+```bash
+NOTIFY_CATEGORIES=crypto,politics
+```
+
+When set, only `claim_created` events whose category matches an allowlisted name
+are sent to Telegram; all other notification types continue to flow normally.
+The default (unset or empty) preserves the current behaviour and notifies every
+claim category.
 
 ## Setup
 
@@ -108,12 +125,14 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, any restart gap (the ledgers that fell out of the RPC's retained window and when the position was recovered), poll/send/skip counters (plus messages dropped by a shutdown drain and cursors automatically rewound to the retained floor), and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip/dedup counters (plus messages dropped by a shutdown drain and cursors automatically rewound to the retained floor), and the last error |
 | `/audit` | Operator only. The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
+| `npm run cursor -- backup` | Backs up the validated cursor file without contacting Stellar or Telegram |
+| `npm run cursor -- restore --from PATH` | Restores a validated backup while holding the poller lock; replacing an existing cursor requires `--force` |
 
 `/start`, `/help`, and Telegram's command menu are generated from the same
 command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
@@ -158,6 +177,7 @@ npm start -- --status          # or: node dist/index.js --status
   "notificationsSent": 11,
   "notificationsFailed": 0,
   "eventsSkipped": 3,
+  "eventsDeduplicated": 0,
   "cursorRewinds": 0,
   "consecutiveFailures": 0,
   "lastError": null,
@@ -177,6 +197,40 @@ npm start -- --status          # or: node dist/index.js --status
 `--status` reads the file only — it never contacts Telegram or the RPC — so it is
 safe to run from a health check or a cron job while the bot is running. It exits
 `0` when a snapshot was read and `1` when there is none or it is not valid JSON.
+
+## Cursor backup and restore
+
+The offline cursor command uses `CURSOR_FILE` from the environment or `.env`
+(default `data/cursor.json`). Backups default to a timestamped sibling file;
+choose another persistent location with `--out`. A backup is a point-in-time,
+byte-preserving copy of a supported current or legacy cursor file and does not
+pause polling. It is written atomically and is never overwritten unless
+`--force` is supplied. Run `npm run build` before using the command in a local
+checkout; the Docker image already includes the compiled CLI.
+
+```bash
+npm run cursor -- backup
+npm run cursor -- backup --out /safe-storage/cursor-before-deploy.json
+npm run cursor -- restore --from /safe-storage/cursor-before-deploy.json --force
+```
+
+Restore validates and normalizes the backup to the current version-1 cursor
+format, takes `INSTANCE_LOCK_FILE` (default `data/poller.lock`) to prevent the
+bot from starting or writing concurrently, and atomically replaces the live
+file. Stop the bot before restoring. A live process holding the lock makes the
+command fail; stale locks are handled by the same PID check used at startup.
+Restoring an existing cursor requires `--force`; malformed or future-version
+files are always rejected. The command prints only paths, schema version, and
+target count, never opaque cursor contents.
+
+Keep backups on persistent storage separate from the deployment's writable
+cursor when possible. On Railway, a one-off command must use the same attached
+`/app/data` volume (or an explicitly mounted backup location). The runtime
+Docker image contains the CLI through the normal TypeScript build. A rollback
+to an older bot release remains compatible with the version-1 cursor format;
+preserve the backup until the restored release has resumed polling. The chain
+remains the source of truth: a backup restores reader position and dedup state,
+not missed notifications or on-chain events.
 
 **What is deliberately not in it.** The snapshot is built from an allowlist of
 fields, so nothing can leak by accident. It never contains the bot token, a
@@ -200,6 +254,13 @@ The chain reader runs standalone. Testnet's Soroban RPC is public and
 unauthenticated, so this needs nothing but the contract ids:
 
 ```bash
+npm run scan                         # both contracts, from the RPC's retained floor
+npm run scan -- --pages 40           # walk further
+npm run scan -- --show 20            # print 20 decoded events per contract
+npm run scan -- --from 4226500       # explicit start ledger
+npm run scan -- --contract market    # scan only the market contract
+npm run scan -- --contract squad     # scan only the squad contract
+npm run scan -- --help               # show usage
 npm run scan                     # both contracts, from the RPC's retained floor
 npm run scan -- --pages 40       # walk further
 npm run scan -- --show 20        # print 20 decoded events per contract
@@ -258,7 +319,14 @@ poller's cursor.
 
 **Bounded output.** Admin events (`oracle_changed`, `ownership_transferred`, …)
 are logged at the progress level and not sent. Unknown or malformed events are
-logged and skipped. Send failures are counted as skipped and do not abort the
+logged and skipped. Send failures are retried on the next cycle; each individual
+Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default 15000) so a
+stalled or rate-limited Telegram endpoint cannot wedge the poller. A send that
+exceeds the timeout is counted as a failure, logged with the target and event
+name (never the token or payload), and the cursor is not advanced past it, so
+the event is retried after a restart. Cursor files remain version-1 and
+compatible with existing deployments; no configuration change is required to
+keep current behavior.ailures are counted as skipped and do not abort the
 run. No bot token or private key ever appears in progress output or the JSON
 report.
 
@@ -372,6 +440,22 @@ exercises the poller's cursor-safety, restart, and bounded-log guarantees end to
 end. `npm test` covers all of it (`tests/mock-*.test.mjs`); run just those with
 `npm run test:mock`.
 
+
+## Decoded event payload caps
+
+Each Soroban event is size-checked **before** native decoding in
+`src/stellar/decode.ts`:
+
+| Cap | Default | Failure mode |
+|---|---|---|
+| Event `value` XDR | 16 KiB (`MAX_DECODED_EVENT_XDR_BYTES`) | Event becomes `unknown` with a short reason; cursor still advances |
+| Per-topic XDR | 1 KiB (`MAX_EVENT_TOPIC_XDR_BYTES`) | Same |
+| Decoded string field | 2048 chars (`MAX_DECODED_STRING_CHARS`) | Same |
+
+Oversized or malformed events never crash the poller and are never re-logged as
+raw remote bytes — only a truncated reason string is kept. No configuration
+change is required; existing cursors remain valid.
+
 ## How the polling works
 
 Soroban's `getEvents` is **not** `eth_getLogs`, and the difference is the whole
@@ -407,12 +491,34 @@ unguarded, one on-chain event becomes two identical chat messages.
 The reader and the poller therefore share a small, bounded **dedup window**
 (`src/dedup.ts`): the ids of the most recently processed events per contract,
 oldest evicted first. A redelivery inside that window is dropped and counted
-instead of posted — visible as `duplicates=` in `npm run scan` output and as
-`eventsDeduplicated` on `/health`. The window is seeded into every scan from the
-cursor file, so the guard survives a restart, and it never grows with chain
-history: an event older than the window can legitimately be announced again,
-which is the accepted trade-off for O(1) memory and a cursor file that stays
-small. Set `EVENT_DEDUP_WINDOW=0` to disable suppression.
+instead of posted — visible as `duplicates=` in `npm run scan` output, as
+`eventsDeduplicated` on `GET /health` and in `status.json`, and as `deduped` in
+`/status`. The window is seeded into every scan from the cursor file, so the
+guard survives a restart, and it never grows with chain history: an event older
+than the window can legitimately be announced again, which is the accepted
+trade-off for O(1) memory and a cursor file that stays small. Set
+`EVENT_DEDUP_WINDOW=0` to disable suppression.
+
+**One event, one key.** Window membership is decided by a single canonical key
+(`eventKey()` in `src/dedup.ts`), derived in strict order:
+
+1. The RPC's own paging token `id` (`<TOID>-<index>`) when present — unique per
+   event and stable across pagination; used verbatim so ids persisted by older
+   releases keep working unchanged.
+2. The same token under the name `eventId`.
+3. A content-derived composite `v2:<ledger>:<txHash>:<txIndex>:<opIndex>:<digest>`
+   when a response omits both — chain positions plus a fixed-length SHA-256
+   digest of the topic XDR. Two events share this key only when every
+   identity-bearing field agrees, so events emitted by the same transaction
+   (even the same operation) are never falsely merged.
+4. Otherwise `null`: no `txHash`, or topic content that cannot be encoded
+   deterministically. Those events pass through **undeduplicated** rather than
+   risk suppressing a real one — a duplicate is recoverable, a wrongly dropped
+   event is not.
+
+The scanner, the poller, and `npm run replay` all route through this one
+function, so an event is never identified one way in one place and another way
+somewhere else.
 
 This is suppression, not backfilling. A dropped duplicate does **not** hold the
 cursor back — the chain remains the record and the walk still advances.
@@ -454,6 +560,15 @@ The poller now recovers from exactly that case, without guessing:
   do not delete or replace the persistent cursor volume to force readiness.
   `GET /health/live` stays `200` for supervisors that need process liveness
   independently of readiness.
+- A cursor that simply **never advances** is the other half of the story: the
+  scan keeps succeeding, so no error counter moves, yet the walk is behind the
+  tip and never closes the gap. After `CURSOR_STALL_CYCLES` (5) such cycles with
+  a lag of at least `CURSOR_STALL_MIN_LAG_LEDGERS` (2) ledgers, the poller logs
+  a `CURSOR STALLED` warning once, `/status` gains a `cursor stalled:` line, and
+  `/health` reports `cursorStalled` per target and becomes `degraded`. Sitting
+  at or within a ledger of the tip is healthy idling and never counts, and a
+  cold start's first cursor is progress, not a stall. Nothing is rewritten: the
+  cursor file is left intact and the bot keeps retrying.
 - The miss is logged as a bounded ledger count (`cursor is N ledger(s) below the
   retained floor`), never as a raw RPC payload, and `/status` and `GET /health`
   expose `cursorRewinds` plus the per-target `rewindFromLedger` while it lasts.
@@ -550,9 +665,15 @@ treatment as the cursor:
 `recentEventIds` is the persisted **dedup window** (see
 [Overlapping pages and duplicate events](#overlapping-pages-and-duplicate-events))
 and is additive: it is bounded by `EVENT_DEDUP_WINDOW` (default `256`) and older
-cursor files without the field load as an empty window. The `version` and the
-`cursor` / `lastEventLedger` fields are unchanged, so the format stays
-backward-compatible in both directions.
+cursor files without the field load as an empty window. Entries are the
+canonical dedup keys: mostly raw RPC paging tokens, but a `v2:` prefix marks a
+content-derived composite for a response that arrived without one. Both forms
+round-trip as opaque strings across restarts, and mixed generations coexist
+harmlessly — a file written by an older release may still hold its
+`<ledger>:<txHash>:<count>` strings, which simply age out of the bounded window
+as new keys are added. No schema bump and no migration are involved. The
+`version` and the `cursor` / `lastEventLedger` fields are unchanged, so the
+format stays backward-compatible in both directions.
 
 `rewindFromLedger` is a second additive field, written **only while a target is
 recovering from a stale cursor** (see
@@ -605,11 +726,12 @@ non-object `targets` map), the poller renames it to
 for debugging and prevents the next `saveCursors` from silently overwriting
 evidence of the failure.
 
-**Deployment note:** a flat file is fine for v0 but it must survive restarts. On
-an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
-at one). On an ephemeral filesystem every restart is a cold start, and events
-that happened while the bot was down are never posted. Swapping this for a real
-KV store is a deliberate future step, not something this repo does today.
+The `version` field is checked on load. A file with a missing or unrecognised
+version is treated as a cold start (warning logged) rather than silently
+misread. This protects against reading a file written by a future release after
+a downgrade.
+
+**Deployment note:** a flat file is fine for v0 but it must survive restarts. At startup, the poller verifies persistent-volume availability and cursor-file permissions by testing write access to the configured `CURSOR_FILE` directory and read/write access to any existing cursor file. If persistent-volume or file-permission verification fails, the poller logs an actionable warning and falls back to in-memory cursor management without crashing, ensuring operational continuity while surfacing volume warnings via `/status` and `/health`. On an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE` at one). On an ephemeral filesystem every restart is a cold start, and events that happened while the bot was down are never posted. Swapping this for a real KV store is a deliberate future step, not something this repo does today.
 
 ## Single-instance lock
 
@@ -627,10 +749,30 @@ bot token or any secret.
 
 ## Failure behaviour
 
+For detailed operational behavior, deployment assumptions, and configuration tuning, see the [Configuration and Operational Reference](docs/configuration-reference.md).
+
 This process is meant to stay up for weeks, so a single failure never ends it:
 
 - **A failed RPC call** fails one contract's scan for one cycle. Its cursor is
   left untouched, so the next cycle resumes exactly where it stopped.
+- **A failed Telegram send** drops one message; the cursor still advances. That
+  is deliberate: holding the cursor back would turn a revoked token or a chat
+  the bot was removed from into an infinite replay, and recovery would flood the
+  channel. Notifications are lossy on purpose — the chain is the record.
+- **A corrupt cursor file** is treated as a cold start rather than a crash.
+- **A cursor file with a missing or unrecognised `version` field** is treated as
+  a cold start; a warning is logged with instructions to delete the file.
+- **A stale cursor** — one pointing to a ledger more than ~10 % of the
+  retention window behind `oldestLedger` — causes a warning that names the
+  cursor file, the gap size, and how to recover. Events in the gap are already
+  gone from the RPC and will not be posted.
+- **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle. A
+  single warning is logged when the cap is hit, and the cursor still advances.
+  Telegram's rate limiter is never the thing that takes the bot down.
+- **Consecutive full-cycle failures** are counted. A structured warning is
+  emitted the first time the count crosses 5, 10, 25, 50, or 100 consecutive
+  failed cycles, naming the RPC URL, the last error, and confirming the cursor
+  is intact.
 - **A partial notification batch** commits the opaque RPC cursor after the
   returned page has been processed. Unknown events, events beyond
   `MAX_NOTIFICATIONS_PER_CYCLE`, and sends that exhaust three bounded retries
@@ -686,6 +828,13 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   wrong local clock stay distinguishable. The clock is saved with the cursors,
   so a restart resumes it instead of reporting `unknown`, and an event without
   a `ledgerClosedAt` never counts as a chain time.
+- **A repeating failure** is logged through a sampler: the first
+  `LOG_SAMPLE_MAX_PER_WINDOW` identical errors in a `LOG_SAMPLE_WINDOW_MS`
+  window print in full, later repeats are counted, and the line that opens the
+  next window reports how many were held back. An RPC that is down for hours
+  therefore costs a handful of lines instead of one per cycle. The running total
+  is exposed as `poller.suppressedLogs` on `/health`; `/status` still shows the
+  latest error verbatim.
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
@@ -743,6 +892,30 @@ Configuration is additive: `SHUTDOWN_TIMEOUT_MS` is optional (see
 format is unchanged — a deployment that omits the new key gets the `10000` ms
 default.
 
+## Log sampling
+
+Operational errors are sampled so a long outage cannot drown the log. Per key —
+`scan:market`, `scan:squad`, and `cycle` — the first `LOG_SAMPLE_MAX_PER_WINDOW`
+identical lines inside a `LOG_SAMPLE_WINDOW_MS` window are printed in full.
+Further repeats are counted, and the line that opens the next window reports how
+many it held back (`suppressed N identical repeats in the previous 300s`). The
+running total is exposed as `poller.suppressedLogs` on `/health`, so a sampled
+log still accounts for every failure. Keys are independent: a noisy market
+contract cannot silence the squad contract's errors, and the text itself is
+still bounded and redacted exactly as before.
+
+Configuration (see `.env.example`):
+
+- `LOG_SAMPLE_MAX_PER_WINDOW` — full lines per key per window (default `3`; `1` logs only the first line of a run)
+- `LOG_SAMPLE_WINDOW_MS` — window length in milliseconds (default `300000`; minimum `1000`)
+
+Sampling is in-memory and resets on restart. It changes log volume only — never
+cursors, sends, retry counts, or the `/status` error text.
+
+**Failure modes:** the sampler is pure bookkeeping keyed by string, so it cannot
+throw into the poll loop. **Rollback:** omit both keys to keep defaults, or raise
+`LOG_SAMPLE_MAX_PER_WINDOW` until nothing is suppressed.
+
 ## Long-running operation
 
 The notifier is meant to run for weeks through Stellar RPC and Telegram outages.
@@ -792,8 +965,14 @@ checks (default `http://127.0.0.1:8787`):
 
 | Path | Meaning |
 | --- | --- |
-| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused`. |
+| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused` and `poller.suppressedLogs`. |
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
+
+**Container Healthcheck:** A dedicated CLI probe is available for Docker `HEALTHCHECK` or Kubernetes `exec` probes. It reads the same environment variables and exits `0` on success:
+```bash
+npm run healthcheck
+# or: node dist/healthcheck.js
+```
 
 The JSON body is operational status only: poller counters, ledgers, truncated
 cursors, whether a target has an error, automatic floor rewinds
@@ -866,6 +1045,12 @@ Configuration (see `.env.example`):
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
 
+Each poll cycle gets a fresh UUID correlation ID. The ID is included in poller
+logs, `/status`, and `/health` so an RPC failure, malformed event, rate-limited
+send, or cycle error can be tied to one bounded cycle. It is not included in
+Telegram messages, persisted cursor data, or carried across a restart; the
+chain remains the source of truth.
+
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the target alert is additive, does not change the
 version-1 cursor format or Telegram delivery, and the previous build safely
@@ -885,8 +1070,9 @@ src/
   health.ts                local loopback GET /health for supervisors
   config.ts                env loading and validation, fails fast (MIMIR_PROFILE profiles)
   bot.ts                   grammy setup: /start, /help, /status, /audit, /contracts, /health, /preview, operator pause/resume
-  dedup.ts                 bounded event-id window (reader + poller dedup)
+  dedup.ts                 canonical event dedup keys (eventKey) + bounded window
   poller.ts                the loop: scan, notify, persist the cursor, flush audit
+  log-sampler.ts           windowed suppression of repetitive error log lines
   audit.ts                 redaction, bounded audit log, JSONL persistence, report renderer
   audit-cli.ts             entrypoint for `npm run audit`
   replay-cli.ts            entrypoint for `npm run replay` (cursor-range replay)
@@ -953,6 +1139,9 @@ truth for IaC; follow Railway's migration guide when the time comes.
 
 ## Development checks
 
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and all
+tests (format, config validation, and poller behaviour — no live Testnet or Telegram
+credentials required), or `npm run build` to produce the production output.
 Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile, config-provenance, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 Run `npm run seed:cursor` to write a local cursor fixture.
 
@@ -979,7 +1168,7 @@ files together — a lockfile that no longer matches `package.json` fails
 `npm ci`, `npm run lockfile:check`, and CI.
 Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, ledger-window, format, fixture, mock-profile, config-provenance, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
-Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md).
+Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Issue and pull-request templates (`.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`) capture the failure-mode, cursor-safety, and deployment-impact details every change must describe.
 
 ## License
 

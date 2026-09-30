@@ -14,6 +14,8 @@
     "start": "node dist/index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test tests/format.test.mjs tests/config.test.mjs tests/poller.test.mjs tests/metrics.test.mjs",
+    "scan": "tsx src/stellar/events.ts"
     "lockfile:check": "node scripts/check-lockfile.mjs",
     "lockfile:reproduce": "node scripts/check-lockfile.mjs --reproduce",
     "test": "npm run build && node --test tests/*.test.mjs",
@@ -25,6 +27,7 @@
     "audit": "tsx src/audit-cli.ts",
     "audit:report": "tsx src/audit-cli.ts",
     "seed:cursor": "tsx src/dev/seedCursor.ts",
+    "cursor": "node dist/cursor-cli.js",
     "replay": "tsx src/replay-cli.ts",
     "replay:mock": "tsx src/replay-cli.ts --mock"
   },

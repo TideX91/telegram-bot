@@ -15,12 +15,12 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
-import { networkLabel } from "../config.js";
 
 export function createRpcServer(config: StellarConfig): rpc.Server {
   return new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
+    timeout: 15000,
   });
 }
 
@@ -28,13 +28,19 @@ export function createRpcServer(config: StellarConfig): rpc.Server {
 export const DEFAULT_EXPLORER_BASE_URL = "https://stellar.expert/explorer";
 
 /**
- * Resolve the explorer network path segment from the configured passphrase.
- * Custom / unknown networks fall back to `testnet` so links stay usable in
- * local quickstart deployments.
+ * Resolve the explorer network path segment from the configured network name.
+ * `futurenet` and `custom` fall back to `testnet` so links remain usable in
+ * local and non-standard deployments. Falls back to passphrase inference when
+ * the `network` field is absent (e.g. in tests that predate multi-network support).
  */
 export function explorerNetworkSegment(config: StellarConfig): "public" | "testnet" {
-  const label = networkLabel(config);
-  return label === "public" ? "public" : "testnet";
+  const net = config.network ?? inferFromPassphrase(config.networkPassphrase);
+  return net === "mainnet" ? "public" : "testnet";
+}
+
+function inferFromPassphrase(passphrase: string): string {
+  if (passphrase === "Public Global Stellar Network ; September 2015") return "mainnet";
+  return "testnet";
 }
 
 function explorerBase(config: StellarConfig): string {
@@ -49,7 +55,7 @@ function explorerPart(value: string): string {
 /** Explorer link for a transaction hash, used in notification footers. */
 export function txExplorerUrl(config: StellarConfig, txHash: string): string {
   const hash = txHash.trim();
-  if (!hash) return "";
+  if (!hash || !/^[a-fA-F0-9]{64}$/.test(hash)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/tx/${explorerPart(hash)}`;
 }
@@ -57,7 +63,7 @@ export function txExplorerUrl(config: StellarConfig, txHash: string): string {
 /** Explorer link for a classic / contract account. */
 export function accountExplorerUrl(config: StellarConfig, address: string): string {
   const id = address.trim();
-  if (!id) return "";
+  if (!id || !/^[GC][A-Z2-7]{55}$/.test(id)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/account/${explorerPart(id)}`;
 }
@@ -65,7 +71,7 @@ export function accountExplorerUrl(config: StellarConfig, address: string): stri
 /** Explorer link for a Soroban contract id, used by /contracts. */
 export function contractExplorerUrl(config: StellarConfig, contractId: string): string {
   const id = contractId.trim();
-  if (!id) return "";
+  if (!id || !/^C[A-Z2-7]{55}$/.test(id)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/contract/${explorerPart(id)}`;
 }
@@ -184,4 +190,44 @@ export function clampStartLedger(
     return { startLedger: window.oldestLedger, clamped: true };
   }
   return { startLedger: requested, clamped: false };
+}
+
+/**
+ * Generates a synthetic Soroban event fixture for testing purposes.
+ *
+ * This function creates a valid-looking Soroban event structure without
+ * requiring actual RPC calls or signing keys. It is used to ensure the
+ * read-only Mimir notifier remains reliable during long-running Stellar
+ * and Telegram failures.
+ *
+ * @param config - The Stellar configuration object.
+ * @param txHash - A mock transaction hash for the fixture.
+ * @returns A synthetic Soroban event object.
+ */
+export function generateSyntheticEventFixture(
+  config: StellarConfig,
+  txHash: string = "mock-tx-hash-1234567890abcdef"
+): rpc.GetEventsResponse {
+  const network =
+    config.networkPassphrase === "Public Global Stellar Network ; September 2015"
+      ? "public"
+      : "testnet";
+
+  return {
+    events: [
+      {
+        type: "contract",
+        contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        id: "1234567890",
+        ledger: 12345678,
+        ledgerClosedAt: new Date().toISOString(),
+        inSuccessfulContractEvent: true,
+        contractEventType: "log",
+        topic: ["bG9nIGV2ZW50"], // Base64 encoded "log event"
+        data: "SGVsbG8gV29ybGQ=", // Base64 encoded "Hello World"
+        txHash: txHash,
+      },
+    ],
+    latestLedger: 12345678,
+  };
 }

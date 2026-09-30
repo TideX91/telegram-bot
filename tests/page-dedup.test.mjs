@@ -7,7 +7,7 @@ import test from "node:test";
 import { nativeToScVal, xdr } from "@stellar/stellar-sdk";
 
 import { createPoller } from "../dist/poller.js";
-import { paginatedGetEvents } from "../dist/stellar/events.js";
+import { paginatedGetEvents, readContractEvents } from "../dist/stellar/events.js";
 
 // ── deterministic, offline doubles ───────────────────────────────────────────
 
@@ -196,6 +196,72 @@ test("an event with no id and no tx hash is not silently dropped", async () => {
   assert.equal(scan.duplicates, 0);
 });
 
+test("id-less events sharing a transaction are never falsely merged", async () => {
+  // The retired `ledger:txHash:<topic-count>` key collapsed both of these
+  // into "40:<txHash>:2" — one real event silently suppressed. Content-derived
+  // keys keep them apart.
+  const txHash = "cd".repeat(32);
+  const first = { ...rawEvent("", 40), txHash, topic: ["ab", "c"] };
+  const second = { ...rawEvent("", 40), txHash, topic: ["a", "bc"] };
+  const server = serverReturning([
+    { events: [first, second], cursor: TIP_CURSOR, latestLedger: TIP },
+  ]);
+
+  const scan = await paginatedGetEvents(
+    server,
+    [{ type: "contract", contractIds: [MARKET] }],
+    { startLedger: 1 },
+  );
+
+  assert.equal(scan.events.length, 2, "distinct id-less events both survive");
+  assert.equal(scan.duplicates, 0);
+});
+
+test("an id-less event repeated by an overlapping page is still suppressed", async () => {
+  const idless = { ...rawEvent("", 40), topic: ["same"] };
+  const server = serverReturning([
+    { events: [idless], cursor: cursorAt(50, 1), latestLedger: TIP },
+    { events: [idless], cursor: TIP_CURSOR, latestLedger: TIP },
+  ]);
+
+  const scan = await paginatedGetEvents(
+    server,
+    [{ type: "contract", contractIds: [MARKET] }],
+    { startLedger: 1 },
+  );
+
+  assert.equal(scan.events.length, 1, "the composite key suppresses the repeat");
+  assert.equal(scan.duplicates, 1);
+  assert.equal(scan.pages, 2);
+  assert.equal(scan.cursor, TIP_CURSOR, "a duplicate never costs the resume token");
+});
+
+test("malformed XDR and non-object entries never crash the scanner", async () => {
+  const target = { source: "market", contractId: MARKET };
+  const malformed = {
+    ...rawEvent("", 42),
+    topic: ["!!!not-xdr!!!"],
+    value: "!!!also-not-xdr!!!",
+  };
+  const server = serverReturning([
+    {
+      events: [null, "primitive", 42, malformed, rawEvent("good", 43)],
+      cursor: TIP_CURSOR,
+      latestLedger: TIP,
+    },
+  ]);
+
+  const scan = await readContractEvents(server, target, { startLedger: 1 });
+
+  // The walk completes, non-objects are skipped, and nothing threw.
+  assert.ok(scan.events.every((e) => e !== null && typeof e === "object"));
+  assert.ok(scan.events.some((e) => e.eventId === "good"), "the decodable event survives");
+  const degraded = scan.events.find((e) => e.eventId === "");
+  assert.ok(degraded, "the malformed entry is decoded, not dropped");
+  assert.equal(degraded.payload.name, "unknown");
+  assert.ok(typeof degraded.payload.reason === "string" && degraded.payload.reason.length > 0);
+});
+
 // ── poller: cross-cycle + restart integration ────────────────────────────────
 
 /** A fake RPC that redelivers the same market event on every page, forever. */
@@ -317,4 +383,36 @@ test("a corrupt cursor file still cold-starts and notifies (dedup never wedges t
   } finally {
     await poller.stop();
   }
+});
+
+test("an id-less redelivered event is notified once and persisted as a v2 composite key", async (t) => {
+  const cursorFile = await withTempCursor(t);
+  const event = claimCreatedEvent("", 80);
+  const sent = [];
+
+  const poller = createPoller({
+    config: baseConfig(cursorFile),
+    server: redeliveringServer(event),
+    send: async (text) => {
+      sent.push(text);
+    },
+  });
+
+  await poller.start();
+  try {
+    await waitFor(() => poller.status().notificationsSent >= 1);
+    await waitFor(() => poller.status().cycles >= 3);
+
+    assert.equal(sent.length, 1, "the redelivery is suppressed, not re-sent");
+    assert.ok(poller.status().eventsDeduplicated >= 1, "redelivery counted");
+  } finally {
+    await poller.stop();
+  }
+
+  // The derived key — not an RPC id — is what lands in the cursor file, so a
+  // restart restores exactly the window the next cycle needs.
+  const saved = JSON.parse(await readFile(cursorFile, "utf8"));
+  const ids = saved.targets.market.recentEventIds;
+  assert.equal(ids.length, 1, "window is bounded and persisted");
+  assert.match(ids[0], /^v2:80:[0-9a-f]{64}:\?:\?:[0-9a-f]{16}$/);
 });

@@ -1,0 +1,102 @@
+name: Bug report
+description: Report a reliability, cursor-safety, or notification problem in the Mimir notifier.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Before filing, please read the
+        [incident runbook](docs/incident-runbook.md) and the
+        [operator audit trail](README.md#operator-audit-trail) section — `npm run audit`,
+        `/health`, and `/status` output are designed to be pasted into an issue verbatim.
+
+        Operating principles this bot must always keep:
+        * The **chain is the source of truth** — the bot is read-only and never holds signing keys.
+        * Every failure mode (malformed event, stale cursor, RPC failure, Telegram failure,
+          restart, rate limit) has **bounded, documented behavior**.
+        * Logs and status output must never contain bot tokens, private keys, payment proofs,
+          or unbounded remote payloads.
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences. What is not working, and what did you expect?
+    validations:
+      required: true
+  - type: dropdown
+    id: failure-mode
+    attributes:
+      label: Failure mode
+      description: Which long-running phase does this concern?
+      multiple: true
+      options:
+        - Malformed / unknown event handling
+        - Stale cursor or cursor file
+        - RPC failure (getEvents / getHealth)
+        - Telegram send failure or rate limit
+        - Restart / resume / shutdown behavior
+        - Per-cycle notification cap
+        - Config, provenance, or health reporting
+        - Scanner / replay / audit tooling
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected vs actual behavior
+      description: >
+        What should happen (bounded, per the docs) versus what happened. If the bot kept
+        running through it, say so — staying up through a single bad cycle is expected.
+    validations:
+      required: true
+  - type: textarea
+    id: logs-status
+    attributes:
+      label: Logs / status / audit snippets
+      description: >
+        Paste the `[poller]`, `[bot]`, `/status`, `GET /health`, or `npm run audit` lines here.
+        These are already redacted — do not add bot tokens, private keys, or payment proofs.
+      render: shell
+  - type: textarea
+    id: cursor-safety
+    attributes:
+      label: Cursor safety
+      description: >
+        What was the cursor file's state before and after? E.g. unchanged after an RPC failure,
+        advanced after partial Telegram delivery, quarantined on corrupt JSON, rewound to the
+        retained floor. Include a bounded cursor preview or the `cursorRewinds` / `rewindFromLedger`
+        counters if relevant.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >
+        Paste the boot `[boot] config` provenance line (names and origins only — it never
+        contains values), the active `MIMIR_PROFILE`, the network label, and the commit or
+        release you ran.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce (credential-free preferred)
+      description: >
+        Prefer a deterministic reproduction using the local mock profile — no Testnet, no
+        Telegram credentials:
+        `npm run mock:poll -- --fail-events error`, `--stale-cursor`, `--malformed`, or a scanner
+        run (`npm run scan -- --mock`). Otherwise describe the exact sequence leading to the issue.
+      placeholder: |
+        1.
+        2.
+        3.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Test expectations
+      description: >
+        The fix should add focused positive, negative, boundary, restart, and regression coverage
+        under `tests/`, keep `npm run typecheck && npm run build && npm test` green without live
+        Testnet or Telegram credentials, and document any config or cursor-format change.

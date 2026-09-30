@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { nativeToScVal } from "@stellar/stellar-sdk";
+
 import { DEFAULT_DEDUP_WINDOW, EventDedupWindow, eventKey } from "../dist/dedup.js";
 
 // ── positive ─────────────────────────────────────────────────────────────────
@@ -20,9 +22,60 @@ test("eventKey prefers the RPC id and accepts a decoded event's eventId", () => 
   assert.equal(eventKey({ id: "", eventId: "9-9" }), "9-9");
 });
 
-test("eventKey falls back to ledger/tx/topic-count when no id is present", () => {
-  assert.equal(eventKey({ txHash: "aa", ledger: 5, topic: [1, 2] }), "5:aa:2");
-  assert.equal(eventKey({ txHash: "aa", ledger: 5, topic: [] }), "5:aa:0");
+test("eventKey derives a v2 content-derived composite when no id is present", () => {
+  const base = {
+    txHash: "aa",
+    ledger: 5,
+    transactionIndex: 7,
+    operationIndex: 0,
+    topic: ["t1", "t2"],
+  };
+  const key = eventKey(base);
+  assert.match(key, /^v2:5:aa:7:0:[0-9a-f]{16}$/);
+
+  // Deterministic: the same input derives the same key on every run, which is
+  // what lets a persisted window suppress a redelivery after a restart.
+  assert.equal(eventKey({ ...base }), key);
+});
+
+test("composite key separates events the old topic-count format merged", () => {
+  // Both used to collapse to "5:aa:2" — a real event silently suppressed.
+  const a = eventKey({ ledger: 5, txHash: "aa", topic: ["ab", "c"] });
+  const b = eventKey({ ledger: 5, txHash: "aa", topic: ["a", "bc"] });
+  assert.notEqual(a, b);
+
+  // Element order is identity-bearing too.
+  const swapped = eventKey({ ledger: 5, txHash: "aa", topic: ["t2", "t1"] });
+  assert.notEqual(swapped, eventKey({ ledger: 5, txHash: "aa", topic: ["t1", "t2"] }));
+
+  // Transaction/operation positions disambiguate events in the same tx.
+  const positioned = eventKey({
+    ledger: 5,
+    txHash: "aa",
+    transactionIndex: 2,
+    operationIndex: 3,
+    topic: ["t"],
+  });
+  const unpositioned = eventKey({ ledger: 5, txHash: "aa", topic: ["t"] });
+  assert.match(unpositioned, /^v2:5:aa:\?:\?:[0-9a-f]{16}$/);
+  assert.notEqual(positioned, unpositioned);
+});
+
+test("topic digest is representation-independent: base64 XDR string equals its ScVal", () => {
+  // The HTTP layer sees base64 strings, the SDK layer ScVal objects; both are
+  // the same on-chain bytes and must derive the same key.
+  const scVal = nativeToScVal("claim_created", { type: "symbol" });
+  const fromString = eventKey({ ledger: 5, txHash: "aa", topic: [scVal.toXDR("base64")] });
+  const fromScVal = eventKey({ ledger: 5, txHash: "aa", topic: [scVal] });
+  assert.equal(fromString, fromScVal);
+
+  // Distinct ScVals never collide (JSON.stringify would yield "{}" for both).
+  const other = eventKey({
+    ledger: 5,
+    txHash: "aa",
+    topic: [nativeToScVal("claim_challenged", { type: "symbol" })],
+  });
+  assert.notEqual(fromScVal, other);
 });
 
 // ── negative ─────────────────────────────────────────────────────────────────
@@ -39,6 +92,21 @@ test("a window with capacity 0 disables dedup: every id is reported new", () => 
 test("eventKey returns null when there is nothing stable to key on", () => {
   assert.equal(eventKey({}), null);
   assert.equal(eventKey({ id: null, eventId: undefined, txHash: "" }), null);
+  // No topic array to digest: identity is never invented.
+  assert.equal(eventKey({ txHash: "aa", ledger: 5 }), null);
+  assert.equal(eventKey({ txHash: "aa", ledger: 5, topic: "not-an-array" }), null);
+  // Unencodable topic content: pass through rather than guess.
+  const circular = {};
+  circular.self = circular;
+  assert.equal(eventKey({ txHash: "aa", topic: [circular] }), null);
+  assert.equal(eventKey({ txHash: "aa", topic: [undefined] }), null);
+});
+
+test("a non-object input derives no key instead of crashing", () => {
+  assert.equal(eventKey(null), null);
+  assert.equal(eventKey(undefined), null);
+  assert.equal(eventKey("primitive"), null);
+  assert.equal(eventKey(42), null);
 });
 
 test("a null key is never recorded and never reported as duplicate", () => {
@@ -46,6 +114,23 @@ test("a null key is never recorded and never reported as duplicate", () => {
   assert.equal(window.add(null), true);
   assert.equal(window.add(null), true);
   assert.equal(window.size, 0);
+});
+
+test("an oversized key passes through but is never retained (bounded persistence)", () => {
+  const window = new EventDedupWindow(4);
+  const hostile = `1-2-${"x".repeat(4096)}`;
+
+  assert.equal(window.add(hostile), true, "treated as new, not rejected");
+  assert.equal(window.has(hostile), false, "never retained");
+  assert.equal(window.size, 0, "cursor-file entries stay bounded");
+  assert.deepEqual(window.toJSON(), []);
+
+  // Normal keys around the limit are unaffected: a realistic composite fits
+  // with room to spare.
+  const composite = eventKey({ ledger: 5, txHash: "a".repeat(64), topic: ["t"] });
+  assert.ok(composite.length < 512);
+  assert.equal(window.add(composite), true);
+  assert.equal(window.add(composite), false);
 });
 
 // ── boundary ─────────────────────────────────────────────────────────────────
@@ -96,6 +181,23 @@ test("a window survives a JSON round trip (restart) and still rejects redelivery
   assert.deepEqual(restored.toJSON(), ["1", "2", "3"]);
   assert.equal(restored.add("3"), false, "redelivered id is suppressed after restart");
   assert.equal(restored.add("4"), true, "a genuinely new id is still accepted");
+});
+
+test("a restarted window keeps raw TOIDs, v2 composites and retired-format keys working", () => {
+  // A cursor file written by an older release can hold the retired
+  // `ledger:txHash:<count>` strings alongside raw TOIDs; a fresh release adds
+  // v2 composites. All three must round-trip as opaque strings.
+  const composite = eventKey({ ledger: 9, txHash: "cc", topic: ["t"] });
+  const before = new EventDedupWindow(8);
+  before.add("4226500-1");
+  before.add(composite);
+  before.add("9:cc:1");
+
+  const restored = EventDedupWindow.fromJSON(JSON.parse(JSON.stringify(before.toJSON())), 8);
+
+  assert.equal(restored.add("4226500-1"), false, "raw TOID still suppressed");
+  assert.equal(restored.add(eventKey({ ledger: 9, txHash: "cc", topic: ["t"] })), false, "v2 composite still suppressed");
+  assert.equal(restored.add("9:cc:1"), false, "retired-format key still round-trips");
 });
 
 test("fromJSON tolerates garbage, non-string entries, and oversized input", () => {

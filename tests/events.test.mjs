@@ -92,12 +92,8 @@ test("eventCursorLedger: non-numeric TOID returns null", () => {
   assert.equal(eventCursorLedger("0x1A-0"), null);
 });
 
-test("eventCursorLedger: bare number with no dash parses TOID as-is (ledger 0 for small values)", () => {
-  // "12345" has no dash, so split("-")[0] = "12345" which is numeric.
-  // BigInt("12345") >> 32n = 0 because 12345 < 2^32.
-  // The function returns a number (0), not null.
-  const result = eventCursorLedger("12345");
-  assert.ok(typeof result === "number", "should return a number for a numeric-only token");
+test("eventCursorLedger: bare number with no dash is rejected as malformed", () => {
+  assert.equal(eventCursorLedger("12345"), null);
 });
 
 // ── Empty-page walk ───────────────────────────────────────────────────────────

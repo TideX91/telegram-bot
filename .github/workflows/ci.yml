@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Tests run entirely in-process (Node's built-in test runner). No live network
+# calls, no Testnet RPC, no Telegram credentials. The scan CLI and the poller
+# loop both require external services — those are verified manually with
+# `npm run scan` against Testnet.
 permissions:
   contents: read
 
@@ -17,7 +21,23 @@ permissions:
 #   22 – current LTS, used in production
 #   24 – newest LTS, validates forward compatibility
 jobs:
+  scan-secrets:
+    # Secret scanning gate (issue #109). Runs before build so a leaked token
+    # fails fast, without a report that could outlive the rotated secret. The
+    # scanner is offline, zero-dependency and deterministic: it needs no
+    # credentials and its output is always redacted (pinned by
+    # tests/secrets.test.mjs, run in the build job below).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Scan tracked files for secret-shaped strings
+        run: npm run scan:secrets
+
   build:
+    needs: scan-secrets
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -45,6 +65,9 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+      - name: Tests (notification formats + secret-scanner properties)
+        run: npm test
 
       - name: Build
         run: npm run build

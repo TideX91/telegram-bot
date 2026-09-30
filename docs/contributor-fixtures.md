@@ -37,8 +37,8 @@ Do not wire `npm run scan` into automated tests.
 | `tests/fixtures/cursor-corrupt.txt` | Unreadable cursor sample (cold-start path) |
 | `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
 | `tests/format.test.mjs` | Inline event-formatting units (MarkdownV2, USDC, Telegram send failures) |
-| `tests/dedup.test.mjs` | Inline unit cases for the bounded dedup window (`src/dedup.ts`) |
-| `tests/page-dedup.test.mjs` | Fake-RPC overlapping-page walk + fake-Telegram poller/restart cases |
+| `tests/dedup.test.mjs` | Inline unit cases for the canonical key (`eventKey`: RPC id → `eventId` → `v2:` content-derived composite → `null`) and the bounded window (`src/dedup.ts`), including restart/mixed-format round-trips |
+| `tests/page-dedup.test.mjs` | Fake-RPC overlapping-page walk (id-based and id-less keys, malformed-XDR pages) + fake-Telegram poller/restart cases |
 | `tests/bot.test.mjs` | Mocked grammy operator-command routing and exact reply payloads |
 | `tests/poller.test.mjs` | Cursor load/advance, RPC and Telegram failure, send cap, stop semantics, graceful-shutdown flush, drain deadline, shutdown notification drop |
 | `tests/poller-controls.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
@@ -108,12 +108,9 @@ log and not post).
   `cursor` string + `lastEventLedger`. Matches what the poller write-then-renames
   under `CURSOR_FILE` (default `./data/cursor.json`). New files also carry an
   additive, bounded `recentEventIds` dedup window; a file without it is still
-  valid and loads with an empty window.
-- **Stale cursor** (`cursor-stale.json`): same shape as a valid cursor, but the
-  cursor's ledger (`4250000`, i.e. `TOID >> 32`) sits below a sample retained floor
-  of `4300000`. The poller must classify it as a **restart gap**, record what was
-  lost, and recover by rewinding to the floor — never retry it forever behind a
-  floor that has already moved past it.
+  valid and loads with an empty window. Entries are opaque key strings: raw
+  RPC paging tokens, `v2:` content-derived composites, or keys written by
+  older releases — all round-trip unchanged.
 - **Corrupt cursor** (`cursor-corrupt.txt`): not JSON. The poller must treat this
   as a **cold start**, not a crash — leave the in-memory cursor null and begin
   `START_LOOKBACK_LEDGERS` behind tip.
@@ -156,6 +153,9 @@ test("resumes", () =>
 | Unauthorized `/pause` or `/resume` | untouched | no command reply | Mock grammy with a different Telegram user id |
 | Operator pause → restart | version-1 cursor unchanged | no replay | Reload a valid cursor fixture; pause must not persist |
 | Overlapping page / resumed cursor | advances | duplicate suppressed, counted | Fake RPC returns the same event id twice; assert one send |
+| Id-less redelivery (event without an RPC `id`) | advances | duplicate suppressed via `v2:` composite, counted | Fake RPC returns the same id-less event twice; assert one send and a `v2:` key in `recentEventIds` |
+| Id-less events in one transaction | advances | **both** delivered, never merged | Two events sharing ledger/tx/topic-count with different topic content; assert two sends |
+| Malformed XDR / non-object RPC entries | advances | `unknown` payloads skipped, non-objects dropped | Page containing `null`, a primitive, and garbage XDR; assert the scan completes without throwing |
 | Restart with a saved window | resumed | boundary event suppressed | Point two pollers at one temp `CURSOR_FILE` |
 
 ## Failure drills against the local mock

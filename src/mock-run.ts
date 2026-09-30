@@ -101,6 +101,9 @@ async function main(): Promise<void> {
   };
   process.once("SIGINT", () => shutdown("SIGINT"));
   process.once("SIGTERM", () => shutdown("SIGTERM"));
+  if (process.platform === "win32") {
+    process.once("SIGBREAK", () => shutdown("SIGBREAK"));
+  }
 }
 
 main().catch((err: unknown) => {

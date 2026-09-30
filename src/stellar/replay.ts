@@ -47,7 +47,7 @@ import {
   type BotConfig,
   type StellarConfig,
 } from "../config.js";
-import { EventDedupWindow } from "../dedup.js";
+import { EventDedupWindow, eventKey } from "../dedup.js";
 import {
   formatEvent,
   safeErrorMessage,
@@ -265,14 +265,12 @@ async function replayContract(
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
     for (const raw of rawEvents) {
       if (!raw || typeof raw !== "object") continue;
-      const key = raw.id ?? "";
-      if (key && dedup.add(key)) {
-        allEvents.push(decodeEvent(target.source, raw));
-      } else if (key) {
-        duplicates += 1;
-      } else {
-        allEvents.push(decodeEvent(target.source, raw));
-      }
+      // Same canonical key as the live poller and the scanner: the RPC's
+      // paging token first, then the content-derived composite. `null`
+      // (unidentifiable) is recorded by `add` as always-new, so such events
+      // pass through undeduplicated instead of being guessed about.
+      if (dedup.add(eventKey(raw))) allEvents.push(decodeEvent(target.source, raw));
+      else duplicates += 1;
     }
     if (pages === 1) {
       usedStartLedger = startLedger;

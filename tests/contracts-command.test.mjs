@@ -9,7 +9,7 @@ const SQUAD_ID = "C".padEnd(56, "S");
 function fakeConfig(overrides = {}) {
   return {
     botToken: "TEST_TOKEN",
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: MARKET_ID,
     squadContractId: SQUAD_ID,
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -82,23 +82,24 @@ test("contractsMessage renders both contract ids, testnet explorer links, and th
       "\n" +
       "Read\\-only: this bot holds no signing keys and cannot submit transactions\\.\n" +
       "\n" +
-      "*mimir\\-market*\n" +
+      "*mimir\\-market* \\(v1\\)\n" +
       `\`${MARKET_ID}\`\n` +
       `[View on stellar\\.expert](https://stellar.expert/explorer/testnet/contract/${MARKET_ID})\n` +
       "\n" +
-      "*mimir\\-squad*\n" +
+      "*mimir\\-squad* \\(v1\\)\n" +
       `\`${SQUAD_ID}\`\n` +
       `[View on stellar\\.expert](https://stellar.expert/explorer/testnet/contract/${SQUAD_ID})`,
   );
 });
 
-test("contractsMessage switches to the public explorer on the public network passphrase", () => {
+test("contractsMessage switches to the public explorer on mainnet", () => {
   const config = fakeConfig({
+    network: "mainnet",
     networkPassphrase: "Public Global Stellar Network ; September 2015",
   });
   const message = contractsMessage(config);
 
-  assert.match(message, /Mimir on Stellar public/);
+  assert.match(message, /Mimir on Stellar mainnet/);
   assert.match(
     message,
     new RegExp(`stellar\\.expert/explorer/public/contract/${MARKET_ID}`),
@@ -113,7 +114,7 @@ test("/contracts reaches Telegram as the exact MarkdownV2 payload, unaffected by
   await bot.handleUpdate(commandUpdate("/contracts"));
 
   // ctx.reply targets the chat the update came from (a number here), not
-  // config.chatId (used only by the poller's separate createNotifier path).
+  // config.chatIds[0] (used only by the poller's separate createNotifier path).
   // Compare the fields this handler controls rather than the whole payload:
   // grammy's Api layer adds its own undefined-valued fields to the object.
   assert.equal(sent.length, 1);

@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Incident runbook
+    url: https://github.com/majormmu2-bot/telegram-bot/blob/main/docs/incident-runbook.md
+    about: Recovery guidance for missed notifications, stale cursors, and long-running failures — read this before reporting an operational issue.
+  - name: Contributor fixture guide
+    url: https://github.com/majormmu2-bot/telegram-bot/blob/main/docs/contributor-fixtures.md
+    about: Credential-free fixture workflow and failure-mode expectations for the deterministic test suite.
+  - name: Component architecture
+    url: https://github.com/majormmu2-bot/telegram-bot/blob/main/docs/component-architecture.md
+    about: Internal architecture, data flow, and operational behavior of the notifier.

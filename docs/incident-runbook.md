@@ -10,6 +10,13 @@ Operational guidance for recovering the Mimir Telegram notifier from missed noti
 * Cursors must only move according to the poller's existing persistence rules.
 * A shutdown flush may only persist cursors the poller already advanced; it never invents a resume position.
 * Logs and status output must not expose bot tokens, private keys, payment proofs, or unbounded remote payloads.
+  Scrubbing is centralized in `src/redact.ts` (regression suite: `tests/redaction.test.mjs`).
+
+Notification text from contract String fields is bounded to 200 Unicode code
+points before MarkdownV2 escaping. An oversized or malformed transaction hash
+does not receive an explorer link. The original event is still decoded and the
+cursor follows the normal poller rules; truncation affects only the Telegram
+presentation, not chain data or persisted cursor state.
 
 Notification text from contract String fields is bounded to 200 Unicode code
 points before MarkdownV2 escaping. An oversized or malformed transaction hash
@@ -44,6 +51,11 @@ Check:
 * poll/send counters, including automatic floor rewinds (`cursorRewinds`)
 * any target resuming from a floor rewind (`rewindFromLedger`)
 * last error and consecutive failure count
+
+The correlation ID identifies the most recently started poll cycle. Use it to
+group the bounded scan, malformed-event, rate-limit, send, and cycle-error log
+lines for that cycle. A new process creates new IDs; they are intentionally not
+stored in the version-1 cursor file or sent to Telegram.
 
 For a read-only chain diagnostic without a Telegram token:
 
@@ -134,6 +146,12 @@ does not hold the cursor back because replaying every missed notification could
 create an unbounded backlog or flood a recovered chat. The log reports the
 sent/failed/skipped counts for that commit.
 
+Each individual Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default
+`10000`). A send that exceeds this deadline is aborted and counted as a failure
+for that event; the poller continues with the remaining events in the page and
+commits the cursor under the normal rules. The timeout applies per send, not to
+the whole cycle, so a single slow request cannot stall the poller indefinitely.
+
 The Stellar chain remains the authoritative record.
 
 ## Stale or corrupt cursor
@@ -147,6 +165,8 @@ The Stellar chain remains the authoritative record.
   / `GET /health` show a non-null `rewindFromLedger`, after a long outage.
 * `GET /health` returns `503` and a target has `cursorStale: true`, even if the
   other watched contract is scanning successfully.
+* `/status` shows send errors clustered around a single slow event, with the
+  remaining events in the same page still delivered.
 
 ### Recovery
 
@@ -155,6 +175,10 @@ preserve the quarantined copy for investigation.
 
 A syntactically valid cursor that Soroban rejects as stale is first checked
 against a fresh `getHealth()`:
+
+Timing out an individual send does not change cursor behavior: the cursor still
+advances only after the returned page is processed, and a timed-out send is
+treated exactly like any other failed send.
 
 * If the cursor's ledger is **strictly below** `oldestLedger`, the position it
   points at is already unrecoverable, so the poller drops it and rescans from
@@ -192,65 +216,41 @@ On a cold start, the poller begins from its configured lookback rather than repl
 
 Never replace a cursor with an arbitrary ledger or cursor value unless the repository's cursor format and retained-history requirements have been verified. `/pause` and `/resume` are safe alternatives because they leave the version-1 cursor file untouched.
 
-### A cursor whose ledger cannot be parsed
+### Back up or restore a cursor
 
-`/status` and `/health` report `cursorUnreadable` (per target) when a persisted
-cursor string exists but no ledger can be read out of it. The poller leaves that
-cursor in place: the RPC's cursor is opaque by design, so failing to read a
-ledger from it locally is not evidence that the RPC will reject it.
+Use the offline cursor CLI to preserve a valid reader position before a deploy
+or deliberate recovery. A backup can run while polling: cursor writes are
+atomic, so it captures either the prior or the newly committed complete file.
+Keep the backup on persistent storage and preferably outside the directory
+being replaced.
 
-* If the RPC accepts it, the next successful scan advances the cursor and the
-  flag clears on its own.
-* If the RPC keeps rejecting it, the target logs an error every cycle. Preserve
-  the cursor file, then remove it to force a cold start.
+```bash
+npm run cursor -- backup --out /safe-storage/cursor-before-recovery.json
+```
 
-## Restart gaps
+Restore only after stopping the notifier. The command takes
+`INSTANCE_LOCK_FILE` (default `data/poller.lock`) for the duration of the
+atomic replacement, so it fails if a live bot owns the cursor. Existing cursor
+state is never replaced without `--force`:
 
-### Symptoms
+```bash
+npm run cursor -- restore --from /safe-storage/cursor-before-recovery.json --force
+```
 
-* The poller logs `restart gap — cursor at ledger N is M ledger(s) below the RPC
-  retained floor F`.
-* `/status` adds `restart gap: M ledgers unrecoverable, cursor reset <ago>` for
-  the affected target and `Restart gaps detected since start: N`.
-* `GET /health` reports a non-zero `restartGaps` and a per-target `gapLedgers`,
-  with `lastRestartGap` naming the target, the cursor ledger, the floor and the
-  number of ledgers lost.
+The backup must be valid version 1 or a supported legacy cursor file. Malformed
+or future-version backups are rejected without changing the live file. Legacy
+files are normalized to version 1 on restore, including their known dedup
+state. If restore reports a lock error, stop the owning process; only remove a
+leftover lock manually after verifying that no notifier is running. After
+restart, confirm `/status` shows the restored cursor and polling advances.
 
-### What happened
-
-The process was down (or one contract's scans kept failing) for longer than the
-RPC's rolling event window, so the persisted position points below the retained
-floor and the events in between are permanently unreadable. There is no second
-copy of event history to fall back on. The chain is unchanged; only the
-notification timeline has a hole.
-
-Detection does not depend on the RPC rejecting the cursor. Before it asks for
-events, every cycle compares a resume position this build can read against the
-floor the last successful scan proved, so a below-floor position the RPC answers
-with an empty page is caught instead of being retried in silence.
-
-The poller is already recovering from it: the gap is found and repaired by the
-same bounded floor rewind described in
-[Stale or corrupt cursor](#stale-or-corrupt-cursor), which is why the retained
-window is delivered late rather than dropped. What is new is the report — how
-many ledgers were unrecoverable, and when the position was moved.
-
-### Recovery
-
-No action is required for the poller itself, and a gap is reported once per
-occurrence rather than once per cycle.
-
-1. Confirm which target holds the gap and how many ledgers it lost in `/status`.
-2. Confirm the retained floor with `npm run scan` (it prints the window).
-3. Confirm the target resumes advancing: the gap is history once the floor walk
-   returns a fresh resume cursor.
-4. If the missed events matter, recover them out of band with `npm run scan
-   --from <ledger>` over the retained range. Anything below the floor cannot be
-   recovered at all, and hand-editing the cursor to "close" the gap only loses
-   the position the poller would otherwise have resumed from.
-5. Seeing the same target gap repeatedly means the process keeps restarting
-   (check the supervisor and persistent storage), or one contract keeps failing
-   long enough for the window to roll past it again.
+Restoring reader state does not recover Telegram sends already dropped under
+normal lossy-delivery rules. It can replay events after the restored cursor or
+skip newer events if the backup is old; Stellar remains the source of truth.
+On Railway, run the command with the same persistent `/app/data` volume as the
+service, or mount the backup location separately. Keep the original cursor and
+backup until the restarted release is healthy so another restore or release
+rollback remains possible.
 
 ## Process restart
 
@@ -314,7 +314,9 @@ Do not delete `/app/data` cursor state as part of a normal rollback.
 
 ## Rate limiting
 
-Notification bursts are bounded by `MAX_NOTIFICATIONS_PER_CYCLE` and spaced out.
+Notification bursts are bounded by `MAX_NOTIFICATIONS_PER_CYCLE`: each cycle
+reads one RPC page of that size, commits its page cursor, and then spaces sends
+out. A restart therefore replays at most one bounded page.
 
 If Telegram rate limits are observed:
 
@@ -323,11 +325,26 @@ If Telegram rate limits are observed:
 3. Do not disable the notification cap to compensate.
 4. Allow subsequent polling cycles to continue normally.
 
+If sends are timing out rather than being rate limited, confirm
+`TELEGRAM_SEND_TIMEOUT_MS` is set to a value appropriate for the deployment's
+network path before raising it; the default is chosen to keep a single slow
+send from delaying the rest of the cycle.
+
 Do not manually replay large event ranges into Telegram.
 
 ## Malformed or unexpected events
 
-A malformed event must not crash the long-running process.
+A malformed event must not crash the long-running process. XDR conversion and
+event metadata failures are converted to a skipped `unknown` event with a
+bounded reason. The RPC response cursor is retained, so later events in the
+page and later pages remain eligible for processing; no cursor rewind or
+guessed ledger is performed.
+
+`decodeEvent` converts malformed XDR and events introduced by a newer contract
+deployment into a bounded `unknown` record. The poller logs only the contract,
+event name, ledger, and a clipped reason, skips Telegram delivery for that
+event, and continues with the RPC cursor returned by the scan. This protects
+the long-running reader while preserving the chain as the source of truth.
 
 `decodeEvent` converts malformed XDR and events introduced by a newer contract
 deployment into a bounded `unknown` record. The poller logs only the contract,
@@ -339,7 +356,7 @@ When investigating:
 
 1. Use `npm run scan` to inspect the affected event range.
 2. Confirm the contract and ledger involved.
-3. Check the decoded event output without copying unrestricted remote payloads into logs or tickets.
+3. Check the bounded event name and decode reason without copying unrestricted remote payloads into logs or tickets.
 4. Preserve the existing cursor behavior.
 
 Do not modify on-chain state or attempt to repair an event by writing to the Mimir contracts.
@@ -412,6 +429,7 @@ After deployment:
   intended — for a deployment with a `.env`, `envFile.present: true` and the
   bot token's source reported as `env-file`, not `profile-default`.
 * Confirm the expected contract IDs and cursor are shown.
+* Record the latest correlation ID when investigating a specific poll cycle.
 * Confirm the last event ledger advances after new events.
 * Monitor RPC and Telegram errors.
 
@@ -465,7 +483,40 @@ npm run build
 npm test
 ```
 
-Also verify the command-level diagnostic path where applicable:
+### Incident drill simulation
+
+Exercise the automated incident drill script to verify notifier resilience across simulated RPC failures, Telegram delivery failures, stale/corrupt cursors, bursts, restarts, and malformed events without requiring live Testnet or Telegram credentials:
+
+```bash
+npm run drill
+```
+
+Or run via the scanner CLI:
+
+```bash
+npm run scan -- --drill
+```
+
+Specific failure modes can be drilled individually:
+
+```bash
+npm run drill -- --scenario rpc-failure
+npm run drill -- --scenario telegram-failure
+npm run drill -- --scenario stale-cursor
+npm run drill -- --scenario corrupt-cursor
+npm run drill -- --scenario malformed-event
+npm run drill -- --scenario rate-limit
+npm run drill -- --scenario restart
+npm run drill -- --scenario scanner-diagnostic
+```
+
+Machine-readable JSON reporting is supported:
+
+```bash
+npm run drill -- --json
+```
+
+Also verify the command-level diagnostic path against live Testnet where applicable:
 
 ```bash
 npm run scan

@@ -1,6 +1,6 @@
 {
   "config": {
-    "chatId": "-1001234567890",
+    "chatIds": [ "-1001234567890"],
     "marketContractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
     "squadContractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
     "rpcUrl": "https://example.invalid/rpc",
